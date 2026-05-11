@@ -1,1 +1,0 @@
-# sausha-bot
