@@ -19,6 +19,9 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -52,6 +55,20 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ─── ФЕЙКОВЫЙ HTTP СЕРВЕР ДЛЯ RENDER ───
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, format, *args):
+        pass
+
+threading.Thread(
+    target=lambda: HTTPServer(('0.0.0.0', 10000), Handler).serve_forever(),
+    daemon=True
+).start()
+# ────────────────────────────────────────
 
 # ─────────────────────────────────────────
 # ПРОМПТ ДЛЯ ИИ
