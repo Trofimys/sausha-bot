@@ -20,6 +20,8 @@ from telegram.ext import (
 )
 
 import threading
+import time
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 if sys.platform == "win32":
@@ -68,6 +70,18 @@ threading.Thread(
     target=lambda: HTTPServer(('0.0.0.0', 10000), Handler).serve_forever(),
     daemon=True
 ).start()
+# ────────────────────────────────────────
+
+# ─── АВТО-ПИНГ ЧТОБЫ НЕ ЗАСЫПАЛ ───
+def _self_ping():
+    while True:
+        try:
+            urllib.request.urlopen("https://sausha-bot.onrender.com")
+        except:
+            pass
+        time.sleep(600)
+
+threading.Thread(target=_self_ping, daemon=True).start()
 # ────────────────────────────────────────
 
 # ─────────────────────────────────────────
