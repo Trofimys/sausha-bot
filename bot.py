@@ -32,7 +32,7 @@ if sys.platform == "win32":
 # ─────────────────────────────────────────
 BOT_TOKEN    = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID   = -1003951653487
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "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"
 ADMIN_ID     = 8627543263
 
 LOG_FILE       = "anon_logs.json"
