@@ -85,7 +85,7 @@ threading.Thread(target=_self_ping, daemon=True).start()
 # ────────────────────────────────────────
 
 # ─────────────────────────────────────────
-# ПРОМПТ ДЛЯ ИИ
+# ПРОМПТ ДЛЯ ИИ (общий чат)
 # ─────────────────────────────────────────
 SYSTEM_PROMPT = """
 Ты — живой, интересный собеседник с лёгким характером. Твоя цель — приятное и естественное общение.
@@ -107,6 +107,18 @@ SYSTEM_PROMPT = """
 
 Без упоминания Вани — ты адекватный собеседник.
 Как только Ваня упомянут — становишься злобным троллем и уничтожаешь его матом.
+""".strip()
+
+# ─────────────────────────────────────────
+# ПРОМПТ ДЛЯ ПРОВЕРКИ ОСМЫСЛЕННОСТИ
+# ─────────────────────────────────────────
+CONTENT_CHECK_PROMPT = """
+Ты — строгий модератор. Оцени текст сообщения по двум критериям:
+1) Осмысленность: сообщение должно выражать связную мысль (вопрос, шутку, эмоцию, приветствие, комментарий), а не быть случайным набором букв/цифр/эмодзи.
+2) Не спам: в нём не должно быть ссылок, рекламы, призывов перейти куда-либо.
+
+Отвечай **только** JSON без пояснений: {"acceptable": true/false, "reason": "краткая причина, если false"}.
+Если сообщение осмысленное и не спам — acceptable=true. Иначе — false с указанием причины (например, "бессмысленный текст", "спам", "пустое сообщение").
 """.strip()
 
 # ─────────────────────────────────────────
@@ -273,26 +285,28 @@ async def call_groq_with_context(user_id: int, user_message: str) -> str:
 
 
 # ─────────────────────────────────────────
-# АНТИСПАМ
+# ПРОВЕРКА КОНТЕНТА (СПАМ + СМЫСЛ)
 # ─────────────────────────────────────────
-async def is_advertisement(text: str) -> tuple[bool, str]:
+async def is_content_acceptable(text: str) -> tuple[bool, str]:
+    """Проверяет, приемлемо ли текстовое сообщение (осмысленное и не спам).
+    Возвращает (True, "") или (False, "причина")."""
     if not text or len(text.strip()) < 2:
-        return False, ""
+        return False, "слишком короткое или пустое"
 
-    system = (
-        'Ты модератор. Отвечай только JSON: {"spam": true/false, "reason": "..."}. '
-        "Блокируй ссылки и юзернеймы."
-    )
-    result = await call_groq_simple(text, system, as_json=True)
-    if result:
-        try:
-            # Убираем возможные markdown-обёртки
-            clean = result.strip().removeprefix("```json").removesuffix("```").strip()
-            parsed = json.loads(clean)
-            return bool(parsed.get("spam", False)), parsed.get("reason", "")
-        except json.JSONDecodeError:
-            pass
-    return False, ""
+    result = await call_groq_simple(text, CONTENT_CHECK_PROMPT, as_json=True)
+    if not result:
+        # При ошибке проверки пропускаем (можно изменить на блокировку)
+        return True, ""
+
+    try:
+        clean = result.strip().removeprefix("```json").removesuffix("```").strip()
+        parsed = json.loads(clean)
+        acceptable = bool(parsed.get("acceptable", False))
+        reason = parsed.get("reason", "") if not acceptable else ""
+        return acceptable, reason
+    except json.JSONDecodeError:
+        logger.warning("Не удалось разобрать ответ модератора: %s", result)
+        return True, ""
 
 
 # ─────────────────────────────────────────
@@ -483,7 +497,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["state"] = ANONYMOUS_MODE
         await query.edit_message_text("✉️ Режим анонимки. Отправьте следующее сообщение.")
 
-    # ── Админ ── (все admin_* и пагинация)
+    # ── Админ ──
     elif data.startswith("admin_") or data.startswith("msg_page_") or data.startswith("start_page_") \
             or data in ("msg_clear", "start_clear"):
         await admin_callback(update, context)
@@ -520,12 +534,26 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # Антиспам (только текст)
-    if text:
-        is_spam, reason = await is_advertisement(text)
-        if is_spam:
-            await update.message.reply_text("🚫 Сообщение не прошло проверку.")
+    # Проверка осмысленности и спама (только если есть текст)
+    if text.strip():
+        acceptable, reason = await is_content_acceptable(text)
+        if not acceptable:
+            await update.message.reply_text(
+                f"🚫 Сообщение не принято: {reason}"
+            )
+            # Логируем попытку отправить мусор
+            add_message_log({
+                "user_id":      user_id,
+                "username":     update.effective_user.username,
+                "first_name":   update.effective_user.first_name,
+                "last_name":    update.effective_user.last_name,
+                "content_type": "текст",
+                "text":         text,
+                "timestamp":    now.isoformat(),
+                "blocked":      reason
+            })
             return
+    # Если текста нет (например, фото без подписи) — пропускаем без проверки
 
     # Отправка в канал
     if not await send_to_channel(context, update, text):
@@ -725,7 +753,7 @@ async def show_start_logs_page(query, page: int) -> None:
 
 
 async def export_logs_csv(query) -> None:
-    """Экспорт логов в CSV — исправлен баг с bytes/BytesIO."""
+    """Экспорт логов в CSV"""
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=[
         "user_id", "username", "first_name", "last_name",
@@ -733,10 +761,9 @@ async def export_logs_csv(query) -> None:
     ])
     writer.writeheader()
     for row in message_logs:
-        # Убедимся, что все ключи присутствуют
         writer.writerow({k: row.get(k, "") for k in writer.fieldnames})
 
-    csv_bytes = buf.getvalue().encode("utf-8-sig")   # utf-8-sig для корректного открытия в Excel
+    csv_bytes = buf.getvalue().encode("utf-8-sig")
     file_obj  = io.BytesIO(csv_bytes)
     file_obj.name = "message_logs.csv"
 
@@ -748,7 +775,7 @@ async def export_logs_csv(query) -> None:
 
 
 async def clean_old_logs(query) -> None:
-    """Удаление логов старше 7 дней — исправлен баг с global."""
+    """Удаление логов старше 7 дней"""
     global message_logs
     cutoff = datetime.now().timestamp() - 7 * 86400
     before = len(message_logs)
