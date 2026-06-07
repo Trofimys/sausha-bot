@@ -294,28 +294,41 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
 async def send_to_channel(context: ContextTypes.DEFAULT_TYPE, update: Update, text: str) -> int | None:
     header  = "*📩 Анонимное сообщение*"
     safe    = escape_mdv2(text) if text else ""
+    # 👇 Исправлено: ссылка на актуального бота
+    footer  = "[✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
     caption = f"{header}\n\n{safe}" if safe else header
-    msg     = update.message
-    bot     = context.bot
+    caption_full = f"{caption}\n\n{footer}" if caption else footer
+
+    msg = update.message
+    bot = context.bot
 
     try:
         sent_msg = None
         if msg.photo:
-            sent_msg = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id, caption=caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id,
+                                            caption=caption_full, parse_mode="MarkdownV2")
         elif msg.video:
-            sent_msg = await bot.send_video(CHANNEL_ID, msg.video.file_id, caption=caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_video(CHANNEL_ID, msg.video.file_id,
+                                            caption=caption_full, parse_mode="MarkdownV2")
         elif msg.animation:
-            sent_msg = await bot.send_animation(CHANNEL_ID, msg.animation.file_id, caption=caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_animation(CHANNEL_ID, msg.animation.file_id,
+                                                caption=caption_full, parse_mode="MarkdownV2")
         elif msg.audio:
-            sent_msg = await bot.send_audio(CHANNEL_ID, msg.audio.file_id, caption=caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_audio(CHANNEL_ID, msg.audio.file_id,
+                                            caption=caption_full, parse_mode="MarkdownV2")
         elif msg.voice:
-            sent_msg = await bot.send_voice(CHANNEL_ID, msg.voice.file_id, caption=caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_voice(CHANNEL_ID, msg.voice.file_id,
+                                            caption=caption_full, parse_mode="MarkdownV2")
         elif msg.document:
-            sent_msg = await bot.send_document(CHANNEL_ID, msg.document.file_id, caption=caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_document(CHANNEL_ID, msg.document.file_id,
+                                               caption=caption_full, parse_mode="MarkdownV2")
         elif msg.sticker:
             sent_msg = await bot.send_sticker(CHANNEL_ID, msg.sticker.file_id)
+            # для стикера ссылка отдельным сообщением
+            if footer:
+                await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
         elif msg.text:
-            sent_msg = await bot.send_message(CHANNEL_ID, caption, parse_mode="MarkdownV2")
+            sent_msg = await bot.send_message(CHANNEL_ID, caption_full, parse_mode="MarkdownV2")
         else:
             return None
         return sent_msg.message_id if sent_msg else None
