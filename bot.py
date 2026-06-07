@@ -294,8 +294,8 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
 async def send_to_channel(context: ContextTypes.DEFAULT_TYPE, update: Update, text: str) -> int | None:
     header  = "*📩 Анонимное сообщение*"
     safe    = escape_mdv2(text) if text else ""
-    # 👇 Исправлено: ссылка на актуального бота
-    footer  = "[✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
+    # 👇 ЦИТИРОВАННАЯ ссылка на бота
+    footer  = "> [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
     caption = f"{header}\n\n{safe}" if safe else header
     caption_full = f"{caption}\n\n{footer}" if caption else footer
 
@@ -324,7 +324,6 @@ async def send_to_channel(context: ContextTypes.DEFAULT_TYPE, update: Update, te
                                                caption=caption_full, parse_mode="MarkdownV2")
         elif msg.sticker:
             sent_msg = await bot.send_sticker(CHANNEL_ID, msg.sticker.file_id)
-            # для стикера ссылка отдельным сообщением
             if footer:
                 await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
         elif msg.text:
