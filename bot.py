@@ -677,6 +677,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ ─────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Игнорируем сообщения из привязанного чата и канала
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
+        return
+
     uid = update.effective_user.id
 
     # --- ожидаем ник для топа ---
@@ -891,7 +896,11 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── КНОПКИ (основной обработчик) ──────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
+        await query.answer()
+        return
     await query.answer()
     data = query.data
     uid  = update.effective_user.id
