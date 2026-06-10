@@ -31,12 +31,13 @@ if sys.platform == "win32":
 # КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────
 BOT_TOKEN    = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
-CHANNEL_ID   = -1003854171715      # Новый ID канала
+CHANNEL_ID   = -1003854171715
 GROQ_API_KEY = "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"
 ADMIN_ID     = 8627543263
 
-LOG_FILE       = "anon_logs.json"
-START_LOG_FILE = "start_logs.json"
+LOG_FILE         = "anon_logs.json"
+START_LOG_FILE   = "start_logs.json"
+MANUAL_IDS_FILE  = "manual_ids.json"
 
 COOLDOWN_SECONDS = 180
 ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
@@ -51,6 +52,7 @@ user_ai_context: dict[int, list[dict]] = {}
 
 message_logs: list[dict] = []
 start_logs:   list[dict] = []
+manual_ids:   list[int]  = []
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -133,13 +135,43 @@ def _save_json(path: str, data: list) -> None:
         logger.error("Ошибка записи %s: %s", path, e)
 
 
+def load_manual_ids() -> list[int]:
+    if not os.path.exists(MANUAL_IDS_FILE):
+        default_ids = [
+            1065994703, 1317499381, 1325803980, 1348135622, 1445013145,
+            1596705847, 1598141304, 1658111818, 1793536849, 1812163694,
+            5012402904, 5058039623, 5093484454, 5222651755, 5244622001,
+            5398185223, 5591478632, 5846879986, 5886556924, 5900068784,
+            5960908435, 6171031779, 6322668072, 6398253412, 6575282623,
+            6647049769, 6677665897, 6716660326, 6762818617, 6811352382,
+            6815122910, 6860269336, 6927328893, 7089300064, 7112529527,
+            7194633128, 7234303233, 7431729389, 7447312123, 7476200435,
+            7691946899, 7810494142, 7824611507, 7854035216, 7927447701,
+            7948610168, 7971084218, 8013816191, 8118408450, 8150421121,
+            8160648800, 8223293549, 8306392029, 8314930012, 8323205303,
+            8340087744, 8366862190, 8475400754, 8484636623, 8534170879,
+            8555817128, 8627543263, 8665408669, 8711321595,
+        ]
+        _save_json(MANUAL_IDS_FILE, default_ids)
+        return default_ids
+    try:
+        return [int(x) for x in _load_json(MANUAL_IDS_FILE)]
+    except:
+        return []
+
+
+def save_manual_ids(ids: list[int]) -> None:
+    _save_json(MANUAL_IDS_FILE, ids)
+
+
 # ─────────────────────────────────────────
 # ЛОГИ
 # ─────────────────────────────────────────
 def load_all_logs() -> None:
-    global message_logs, start_logs
+    global message_logs, start_logs, manual_ids
     message_logs = _load_json(LOG_FILE)
     start_logs   = _load_json(START_LOG_FILE)
+    manual_ids   = load_manual_ids()
 
 
 def add_message_log(entry: dict) -> None:
@@ -422,128 +454,184 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     add_start_log(user.id, user.username, user.first_name, user.last_name)
     context.user_data.clear()
+    await update.message.reply_text("https://t.me/Shkola6_anonchik_bot")
     await main_menu(update, context)
 
 
 # ─────────────────────────────────────────
-# РАССЫЛКА ВСЕМ ПОЛЬЗОВАТЕЛЯМ (ADMIN)
+# АДМИН-ПАНЕЛЬ
 # ─────────────────────────────────────────
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Проверяем права
+def _admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📩 Анонимные сообщения",   callback_data="admin_tab_messages")],
+        [InlineKeyboardButton("👥 Старты",                 callback_data="admin_tab_starts")],
+        [InlineKeyboardButton("📣 Рассылка",               callback_data="admin_broadcast")],
+        [InlineKeyboardButton("➕ Добавить ID",            callback_data="admin_add_ids")],
+        [InlineKeyboardButton("📋 Список ID",              callback_data="admin_list_ids")],
+        [InlineKeyboardButton("📤 Экспорт логов CSV",      callback_data="admin_export")],
+        [InlineKeyboardButton("🧹 Удалить старые (>7 дн)", callback_data="admin_clean_old")],
+    ])
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
-
-    # Извлекаем текст: либо реплай на сообщение, либо текст после команды
-    target_message = None
-    if update.message.reply_to_message:
-        target_message = update.message.reply_to_message
-        text_to_send = target_message.text or target_message.caption or ""
-    else:
-        # Текст после команды, например /broadcast Привет всем!
-        text_to_send = update.message.text.split(" ", 1)[1] if len(update.message.text.split(" ", 1)) > 1 else None
-
-    if not text_to_send:
-        await update.message.reply_text(
-            "ℹ️ Используйте:\n"
-            "/broadcast <текст> — разослать текст\n"
-            "или ответьте на сообщение командой /broadcast"
-        )
-        return
-
-    # Получаем уникальных пользователей из start_logs
-    user_ids = set(entry["user_id"] for entry in start_logs)
-    if not user_ids:
-        await update.message.reply_text("📭 Нет пользователей для рассылки.")
-        return
-
-    await update.message.reply_text(f"📣 Начинаю рассылку для {len(user_ids)} пользователей...")
-
-    sent = 0
-    failed = 0
-    for uid in user_ids:
-        try:
-            await context.bot.send_message(chat_id=uid, text=text_to_send)
-            sent += 1
-            await asyncio.sleep(0.05)  # небольшая задержка, чтобы не упереться в лимиты
-        except Exception as e:
-            logger.warning(f"Не удалось отправить пользователю {uid}: {e}")
-            failed += 1
-
-    await update.message.reply_text(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+    total_msg    = len(message_logs)
+    total_starts = len(start_logs)
+    await update.message.reply_text(
+        f"👑 *Админ-панель*\n\n"
+        f"📩 Сообщений: {total_msg}\n"
+        f"👥 Стартов: {total_starts}",
+        parse_mode="Markdown",
+        reply_markup=_admin_keyboard(),
+    )
 
 
-# ─────────────────────────────────────────
-# ОБРАБОТЧИК КНОПОК
-# ─────────────────────────────────────────
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     data  = query.data
 
-    if data == "menu_anon":
-        context.user_data["state"] = ANONYMOUS_MODE
+    if update.effective_user.id != ADMIN_ID:
+        await query.edit_message_text("⛔ Доступ запрещён.")
+        return
+
+    # Обработка новых кнопок
+    if data == "admin_broadcast":
+        context.user_data["awaiting_broadcast"] = True
         await query.edit_message_text(
-            "✉️ *Режим анонимки активен*\n"
-            "Отправьте текст, фото, видео или голосовое — появится в канале анонимно.",
+            "📣 *Рассылка*\n\nВведите текст сообщения для отправки всем пользователям.\n"
+            "Для отмены нажмите /cancel",
             parse_mode="Markdown",
         )
+        return
 
-    elif data == "menu_ai":
-        context.user_data["state"] = AI_CHAT_MODE
+    if data == "admin_add_ids":
+        context.user_data["awaiting_ids"] = True
         await query.edit_message_text(
-            "🤖 *Режим ИИ активен*\nПросто напишите что-нибудь 💬",
+            "➕ *Добавление ID*\n\n"
+            "Отправьте один или несколько числовых ID через пробел, запятую или с новой строки.\n"
+            "Пример:\n`123456 789012`\n"
+            "Для отмены нажмите /cancel",
             parse_mode="Markdown",
         )
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="Управление чатом:",
-            reply_markup=ai_control_keyboard(),
-        )
+        return
 
-    elif data == "menu_help":
+    if data == "admin_list_ids":
+        ids = ", ".join(str(i) for i in manual_ids) if manual_ids else "пусто"
         await query.edit_message_text(
-            "ℹ️ *Помощь*\n\n"
-            "• *Анонимка:* отправьте любое сообщение — выйдет в канале без вашего имени\\.\n"
-            "• *ИИ\\-чат:* общайтесь с искусственным интеллектом\\.\n"
-            "• /start — вернуться в главное меню\\.",
-            parse_mode="MarkdownV2",
+            f"📋 *Ручной список ID:*\n{ids}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Назад", callback_data="admin_back")
+            ]])
         )
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="Нажмите для возврата:",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔙 Главное меню", callback_data="menu_back")]]
-            ),
-        )
+        return
 
-    elif data == "menu_back":
-        context.user_data.pop("state", None)
-        await main_menu(update, context, edit=True)
-
-    elif data == "ai_reset":
-        user_ai_context.pop(update.effective_user.id, None)
+    # Стандартные кнопки
+    if data == "admin_tab_messages":
+        await show_message_logs_page(query, 0)
+    elif data == "admin_tab_starts":
+        await show_start_logs_page(query, 0)
+    elif data == "admin_export":
+        await export_logs_csv(query)
+    elif data == "admin_clean_old":
+        await clean_old_logs(query)
+    elif data == "admin_back":
+        total_msg    = len(message_logs)
+        total_starts = len(start_logs)
         await query.edit_message_text(
-            "🧠 Память сброшена.",
-            reply_markup=ai_control_keyboard(),
+            f"👑 *Админ-панель*\n\n"
+            f"📩 Сообщений: {total_msg}\n"
+            f"👥 Стартов: {total_starts}",
+            parse_mode="Markdown",
+            reply_markup=_admin_keyboard(),
         )
-
-    elif data == "anon_again":
-        context.user_data["state"] = ANONYMOUS_MODE
-        await query.edit_message_text("✉️ Режим анонимки. Отправьте следующее сообщение.")
-
-    elif data.startswith("admin_") or data.startswith("msg_page_") or data.startswith("start_page_") \
-            or data in ("msg_clear", "start_clear"):
-        await admin_callback(update, context)
-
+    elif data.startswith("msg_page_"):
+        page = int(data.rsplit("_", 1)[-1])
+        await show_message_logs_page(query, page)
+    elif data.startswith("start_page_"):
+        page = int(data.rsplit("_", 1)[-1])
+        await show_start_logs_page(query, page)
+    elif data == "msg_clear":
+        message_logs.clear()
+        _save_json(LOG_FILE, message_logs)
+        await query.edit_message_text("🧹 Логи сообщений очищены.", reply_markup=_admin_keyboard())
+    elif data == "start_clear":
+        start_logs.clear()
+        _save_json(START_LOG_FILE, start_logs)
+        await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=_admin_keyboard())
     else:
-        await query.edit_message_text("Неизвестная команда. Используйте /start.")
+        await query.edit_message_text("Неизвестная команда.")
 
 
 # ─────────────────────────────────────────
-# ОБРАБОТЧИК СООБЩЕНИЙ
+# ОБРАБОТЧИК СООБЩЕНИЙ (с учётом ожидания ID и рассылки)
 # ─────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    # Ожидание ввода ID от админа
+    if context.user_data.get("awaiting_ids") and user_id == ADMIN_ID:
+        text = update.message.text.strip()
+        if not text:
+            await update.message.reply_text("Отправьте хотя бы один числовой ID.")
+            return
+
+        # Извлекаем все числа из текста (разделители пробел, запятая, новая строка)
+        new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
+        if not new_ids:
+            await update.message.reply_text("Не найдено ни одного числа. Попробуйте снова.")
+            return
+
+        added = []
+        for nid in new_ids:
+            if nid not in manual_ids:
+                manual_ids.append(nid)
+                added.append(str(nid))
+
+        if added:
+            save_manual_ids(manual_ids)
+            await update.message.reply_text(f"✅ Добавлены ID: {', '.join(added)}")
+        else:
+            await update.message.reply_text("⚠️ Все эти ID уже есть в списке.")
+
+        context.user_data.pop("awaiting_ids", None)
+        return
+
+    # Ожидание текста рассылки от админа
+    if context.user_data.get("awaiting_broadcast") and user_id == ADMIN_ID:
+        text_to_send = update.message.text
+        if not text_to_send:
+            await update.message.reply_text("Сообщение не может быть пустым.")
+            return
+
+        context.user_data.pop("awaiting_broadcast", None)
+
+        start_ids = set(entry["user_id"] for entry in start_logs)
+        all_ids = list(start_ids | set(manual_ids))
+
+        if not all_ids:
+            await update.message.reply_text("📭 Нет ни одного получателя.")
+            return
+
+        await update.message.reply_text(f"📣 Начинаю рассылку для {len(all_ids)} пользователей...")
+
+        sent = 0
+        failed = 0
+        for uid in all_ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=text_to_send)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.warning(f"Не удалось отправить пользователю {uid}: {e}")
+                failed += 1
+
+        await update.message.reply_text(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+        return
+
+    # Обычные режимы
     state = context.user_data.get("state")
     if state == ANONYMOUS_MODE:
         await handle_anonymous(update, context)
@@ -553,6 +641,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await main_menu(update, context)
 
 
+# ─── ОТМЕНА ОЖИДАНИЯ (ДЛЯ АДМИНА) ───
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if context.user_data.pop("awaiting_broadcast", None) or context.user_data.pop("awaiting_ids", None):
+        await update.message.reply_text("Действие отменено.")
+    else:
+        await update.message.reply_text("Нечего отменять.")
+
+
+# ─────────────────────────────────────────
+# АНОНИМКА И ИИ-ЧАТ (без изменений)
+# ─────────────────────────────────────────
 async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     text    = update.message.text or update.message.caption or ""
@@ -631,74 +732,76 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ─────────────────────────────────────────
-# АДМИН-ПАНЕЛЬ
+# КНОПКИ (ОБЩИЙ ОБРАБОТЧИК)
 # ─────────────────────────────────────────
-def _admin_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩 Анонимные сообщения",   callback_data="admin_tab_messages")],
-        [InlineKeyboardButton("👥 Старты",                 callback_data="admin_tab_starts")],
-        [InlineKeyboardButton("📤 Экспорт логов CSV",      callback_data="admin_export")],
-        [InlineKeyboardButton("🧹 Удалить старые (>7 дн)", callback_data="admin_clean_old")],
-    ])
-
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Доступ запрещён.")
-        return
-    total_msg    = len(message_logs)
-    total_starts = len(start_logs)
-    await update.message.reply_text(
-        f"👑 *Админ-панель*\n\n"
-        f"📩 Сообщений: {total_msg}\n"
-        f"👥 Стартов: {total_starts}",
-        parse_mode="Markdown",
-        reply_markup=_admin_keyboard(),
-    )
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    await query.answer()
     data  = query.data
 
-    if update.effective_user.id != ADMIN_ID:
-        await query.edit_message_text("⛔ Доступ запрещён.")
-        return
-
-    if data == "admin_tab_messages":
-        await show_message_logs_page(query, 0)
-    elif data == "admin_tab_starts":
-        await show_start_logs_page(query, 0)
-    elif data == "admin_export":
-        await export_logs_csv(query)
-    elif data == "admin_clean_old":
-        await clean_old_logs(query)
-    elif data == "admin_back":
-        total_msg    = len(message_logs)
-        total_starts = len(start_logs)
+    if data == "menu_anon":
+        context.user_data["state"] = ANONYMOUS_MODE
         await query.edit_message_text(
-            f"👑 *Админ-панель*\n\n"
-            f"📩 Сообщений: {total_msg}\n"
-            f"👥 Стартов: {total_starts}",
+            "✉️ *Режим анонимки активен*\n"
+            "Отправьте текст, фото, видео или голосовое — появится в канале анонимно.",
             parse_mode="Markdown",
-            reply_markup=_admin_keyboard(),
         )
-    elif data.startswith("msg_page_"):
-        page = int(data.rsplit("_", 1)[-1])
-        await show_message_logs_page(query, page)
-    elif data.startswith("start_page_"):
-        page = int(data.rsplit("_", 1)[-1])
-        await show_start_logs_page(query, page)
-    elif data == "msg_clear":
-        message_logs.clear()
-        _save_json(LOG_FILE, message_logs)
-        await query.edit_message_text("🧹 Логи сообщений очищены.", reply_markup=_admin_keyboard())
-    elif data == "start_clear":
-        start_logs.clear()
-        _save_json(START_LOG_FILE, start_logs)
-        await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=_admin_keyboard())
+
+    elif data == "menu_ai":
+        context.user_data["state"] = AI_CHAT_MODE
+        await query.edit_message_text(
+            "🤖 *Режим ИИ активен*\nПросто напишите что-нибудь 💬",
+            parse_mode="Markdown",
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Управление чатом:",
+            reply_markup=ai_control_keyboard(),
+        )
+
+    elif data == "menu_help":
+        await query.edit_message_text(
+            "ℹ️ *Помощь*\n\n"
+            "• *Анонимка:* отправьте любое сообщение — выйдет в канале без вашего имени\\.\n"
+            "• *ИИ\\-чат:* общайтесь с искусственным интеллектом\\.\n"
+            "• /start — вернуться в главное меню\\.",
+            parse_mode="MarkdownV2",
+        )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="Нажмите для возврата:",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Главное меню", callback_data="menu_back")]]
+            ),
+        )
+
+    elif data == "menu_back":
+        context.user_data.pop("state", None)
+        await main_menu(update, context, edit=True)
+
+    elif data == "ai_reset":
+        user_ai_context.pop(update.effective_user.id, None)
+        await query.edit_message_text(
+            "🧠 Память сброшена.",
+            reply_markup=ai_control_keyboard(),
+        )
+
+    elif data == "anon_again":
+        context.user_data["state"] = ANONYMOUS_MODE
+        await query.edit_message_text("✉️ Режим анонимки. Отправьте следующее сообщение.")
+
+    # Все админские колбэки (включая новые) обрабатываются в admin_callback
+    elif data.startswith("admin_") or data.startswith("msg_page_") or data.startswith("start_page_") \
+            or data in ("msg_clear", "start_clear"):
+        await admin_callback(update, context)
+
+    else:
+        await query.edit_message_text("Неизвестная команда. Используйте /start.")
 
 
+# ─────────────────────────────────────────
+# ОСТАЛЬНЫЕ АДМИН-ФУНКЦИИ (без изменений)
+# ─────────────────────────────────────────
 def _paginate(items: list, page: int, per_page: int = 5) -> tuple[list, int]:
     total_pages = max(1, (len(items) + per_page - 1) // per_page)
     page        = max(0, min(page, total_pages - 1))
@@ -837,7 +940,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))  # новая команда
+    app.add_handler(CommandHandler("cancel", cmd_cancel))  # только для отмены ожидания
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
