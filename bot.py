@@ -17,6 +17,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
     CallbackQueryHandler,
+    ChatMemberHandler,
 )
 import threading
 import time
@@ -28,30 +29,48 @@ if sys.platform == "win32":
 
 BOT_TOKEN    = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID   = -1003854171715
+LINKED_CHAT_ID = -1003718571364   # чат, привязанный к каналу (для комментариев)
 GROQ_API_KEY = "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"
 ADMIN_ID     = 8627543263
 
-LOG_FILE        = "anon_logs.json"
-START_LOG_FILE  = "start_logs.json"
-MANUAL_IDS_FILE = "manual_ids.json"
-TOP_FILE        = "top_data.json"
+LOG_FILE         = "anon_logs.json"
+START_LOG_FILE   = "start_logs.json"
+MANUAL_IDS_FILE  = "manual_ids.json"
+TOP_FILE         = "top_data.json"
+COMMENTS_FILE    = "anon_comments.json"   # БАЗ анонимных комментариев
 
-COOLDOWN_SECONDS = 180
-ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
-TYPING_DELAY    = 0.015
-UPDATE_INTERVAL = 5
-GROQ_SEMAPHORE  = asyncio.Semaphore(5)
+COOLDOWN_SECONDS  = 180
+COMMENT_COOLDOWN  = 60   # кулдаун для комментариев — 1 мин
+ANONYMOUS_MODE, AI_CHAT_MODE, COMMENT_MODE = 1, 2, 3
+TYPING_DELAY      = 0.015
+UPDATE_INTERVAL   = 5
+GROQ_SEMAPHORE    = asyncio.Semaphore(5)
 
-user_last_time:  dict[int, datetime]   = {}
-user_ai_context: dict[int, list[dict]] = {}
-message_logs: list[dict] = []
-start_logs:   list[dict] = []
-manual_ids:   list[int]  = []
-top_data:     dict       = {}
+# Эмодзи-животные для псевдонимов
+ANIMAL_EMOJIS = [
+    "🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯",
+    "🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🦆","🦅",
+    "🦉","🦇","🐺","🐗","🐴","🦄","🐝","🐛","🦋","🐌",
+    "🐞","🐜","🦟","🦗","🕷","🦂","🐢","🐍","🦎","🦖",
+    "🦕","🐙","🦑","🦐","🦀","🐡","🐠","🐟","🐬","🐳",
+    "🦈","🐊","🐅","🐆","🦓","🦍","🦧","🦣","🐘","🦛",
+    "🦏","🐪","🐫","🦒","🦘","🦬","🐃","🐂","🐄","🐎",
+    "🐖","🐏","🐑","🦙","🐐","🦌","🐕","🐩","🦮","🐈",
+]
+
+user_last_time:     dict[int, datetime]   = {}
+user_comment_time:  dict[int, datetime]   = {}
+user_ai_context:    dict[int, list[dict]] = {}
+message_logs:  list[dict] = []
+start_logs:    list[dict] = []
+manual_ids:    list[int]  = []
+top_data:      dict       = {}
+anon_comments: dict       = {}   # {post_msg_id: {user_id: {"alias": "...", "messages": [...]}}}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── ВЕБ-СЕРВЕР (keep-alive) ───────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
@@ -70,6 +89,7 @@ def _self_ping():
 
 threading.Thread(target=_self_ping, daemon=True).start()
 
+# ── ПРОМПТЫ ───────────────────────────────
 SYSTEM_PROMPT = """
 Ты — живой, интересный собеседник с лёгким характером. Твоя цель — приятное и естественное общение.
 Ты не используешь шаблонные фразы и не повторяешь заученные ответы.
@@ -84,8 +104,10 @@ CONTENT_CHECK_PROMPT = """
 Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
 """.strip()
 
+# ── УТИЛИТЫ ───────────────────────────────
 _MDV2 = re.compile(r'([_*\[\]()~`>#+=|{}.!\\-])')
-def escape_mdv2(t: str) -> str: return _MDV2.sub(r"\\\1", t)
+def escape_mdv2(t: str) -> str:
+    return _MDV2.sub(r"\\\1", t)
 
 def _load_json(path):
     if not os.path.exists(path): return []
@@ -93,12 +115,19 @@ def _load_json(path):
         with open(path, encoding="utf-8") as f: return json.load(f)
     except: return []
 
+def _load_json_dict(path):
+    if not os.path.exists(path): return {}
+    try:
+        with open(path, encoding="utf-8") as f: return json.load(f)
+    except: return {}
+
 def _save_json(path, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e: logger.error("Ошибка записи %s: %s", path, e)
 
+# ── ЗАГРУЗКА ДАННЫХ ───────────────────────
 def current_week_key() -> str:
     today = datetime.now()
     return (today - timedelta(days=today.weekday())).strftime("%Y-W%V")
@@ -128,21 +157,27 @@ def load_manual_ids() -> list[int]:
 def save_manual_ids(ids): _save_json(MANUAL_IDS_FILE, ids)
 
 def load_all_logs():
-    global message_logs, start_logs, manual_ids, top_data
-    message_logs = _load_json(LOG_FILE)
-    start_logs   = _load_json(START_LOG_FILE)
-    manual_ids   = load_manual_ids()
-    raw = _load_json(TOP_FILE)
-    top_data = raw if isinstance(raw, dict) else {}
+    global message_logs, start_logs, manual_ids, top_data, anon_comments
+    message_logs   = _load_json(LOG_FILE)
+    start_logs     = _load_json(START_LOG_FILE)
+    manual_ids     = load_manual_ids()
+    raw            = _load_json(TOP_FILE)
+    top_data       = raw if isinstance(raw, dict) else {}
+    raw_c          = _load_json_dict(COMMENTS_FILE)
+    anon_comments  = raw_c if isinstance(raw_c, dict) else {}
 
-def add_message_log(entry): message_logs.append(entry); _save_json(LOG_FILE, message_logs)
+def add_message_log(entry):
+    message_logs.append(entry)
+    _save_json(LOG_FILE, message_logs)
 
 def add_start_log(uid, uname, fn, ln):
-    start_logs.append({"user_id": uid, "username": uname, "first_name": fn,
-                        "last_name": ln, "timestamp": datetime.now().isoformat()})
+    start_logs.append({
+        "user_id": uid, "username": uname, "first_name": fn,
+        "last_name": ln, "timestamp": datetime.now().isoformat()
+    })
     _save_json(START_LOG_FILE, start_logs)
 
-# ── ТОП (ИСПРАВЛЕНО) ─────────────────────
+# ── ТОП ───────────────────────────────────
 def get_top_entries() -> list[dict]:
     week = current_week_key()
     res = [{"user_id": int(k), "nick": v.get("nick","Аноним"), "count": v.get("count",0)}
@@ -150,53 +185,42 @@ def get_top_entries() -> list[dict]:
     return sorted(res, key=lambda x: x["count"], reverse=True)
 
 def increment_top(uid: int):
-    """Увеличивает счётчик. Если пользователь не в топе — просто ничего не делает."""
     k = str(uid)
     week = current_week_key()
     if k not in top_data:
-        return  # не участвует — не считаем
+        return
     e = top_data[k]
     if e.get("week") != week:
         e["count"] = 0
-        e["week"] = week
+        e["week"]  = week
     e["count"] = e.get("count", 0) + 1
     _save_json(TOP_FILE, top_data)
 
 def join_top(uid: int, nick: str):
-    k = str(uid)
+    k    = str(uid)
     week = current_week_key()
     if k in top_data:
-        old_week = top_data[k].get("week")
-        old_count = top_data[k].get("count", 0)
-        # Если та же неделя — сохраняем накопленный счёт, просто меняем ник
-        if old_week == week:
+        if top_data[k].get("week") == week:
             top_data[k]["nick"] = nick
         else:
-            # Новая неделя — считаем анонимки ЭТОЙ недели из логов
-            count_this_week = _count_user_anons_this_week(uid)
-            top_data[k] = {"nick": nick, "count": count_this_week, "week": week}
+            count = _count_user_anons_this_week(uid)
+            top_data[k] = {"nick": nick, "count": count, "week": week}
     else:
-        # Впервые вступает — считаем уже отправленные анонимки за эту неделю
-        count_this_week = _count_user_anons_this_week(uid)
-        top_data[k] = {"nick": nick, "count": count_this_week, "week": week}
+        count = _count_user_anons_this_week(uid)
+        top_data[k] = {"nick": nick, "count": count, "week": week}
     _save_json(TOP_FILE, top_data)
 
 def _count_user_anons_this_week(uid: int) -> int:
-    """Считает кол-во анонимок пользователя за текущую неделю из логов."""
     week_start = datetime.now() - timedelta(days=datetime.now().weekday())
     week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
     count = 0
     for entry in message_logs:
-        if entry.get("user_id") != uid:
-            continue
-        if entry.get("blocked"):
+        if entry.get("user_id") != uid or entry.get("blocked"):
             continue
         try:
-            ts = datetime.fromisoformat(entry["timestamp"])
-            if ts >= week_start:
+            if datetime.fromisoformat(entry["timestamp"]) >= week_start:
                 count += 1
-        except:
-            pass
+        except: pass
     return count
 
 def leave_top(uid: int):
@@ -211,15 +235,13 @@ def is_in_top(uid: int) -> bool:
 
 def build_top_text() -> str:
     entries = get_top_entries()
-    today = datetime.now()
+    today   = datetime.now()
     days_until_monday = (7 - today.weekday()) % 7 or 7
-    reset = (today + timedelta(days=days_until_monday)).strftime("%d.%m")
-    week  = current_week_key()
-
-    MEDALS = ["🥇","🥈","🥉"]
-    PLACES = ["4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-
-    lines = [
+    reset   = (today + timedelta(days=days_until_monday)).strftime("%d.%m")
+    week    = current_week_key()
+    MEDALS  = ["🥇","🥈","🥉"]
+    PLACES  = ["4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    lines   = [
         "🏆 ТОП АНОНИМЩИКОВ НЕДЕЛИ",
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
         f"📅 Неделя: {week}",
@@ -227,38 +249,62 @@ def build_top_text() -> str:
         "",
     ]
     if not entries:
-        lines += [
-            "😶 Пока никого нет в рейтинге",
-            "",
-            "💡 Нажми «Вступить в топ» чтобы",
-            "   участвовать в соревновании!",
-        ]
+        lines += ["😶 Пока никого нет в рейтинге","","💡 Нажми «Вступить в топ» чтобы","   участвовать в соревновании!"]
     else:
         max_count = max(e["count"] for e in entries) or 1
         for i, e in enumerate(entries[:10]):
-            medal = MEDALS[i] if i < 3 else PLACES[i-3] if i < 10 else f"{i+1}."
-            pct   = e["count"] / max_count
-            filled = round(pct * 8)
-            bar   = "█" * filled + "░" * (8 - filled)
-            nick  = e["nick"][:20]
+            medal  = MEDALS[i] if i < 3 else PLACES[i-3] if i < 10 else f"{i+1}."
+            filled = round(e["count"] / max_count * 8)
+            bar    = "█" * filled + "░" * (8 - filled)
+            nick   = e["nick"][:20]
             lines.append(f"{medal}  {nick}")
             lines.append(f"    ▏{bar}▏  {e['count']} анонимок")
             lines.append("")
-    lines += ["▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"]
+    lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
     return "\n".join(lines)
 
-# ── АНИМАЦИЯ ПЕЧАТАНИЯ ────────────────────
-async def typewriter_reply(update: Update, full_text: str):
-    if not full_text: return
-    msg = await update.message.reply_text("▌")
-    displayed = ""
-    for i, ch in enumerate(full_text, 1):
-        displayed += ch
-        if i % UPDATE_INTERVAL == 0 or i == len(full_text):
-            cursor = "" if i == len(full_text) else "▌"
-            try: await msg.edit_text(displayed + cursor)
-            except: pass
-        await asyncio.sleep(TYPING_DELAY)
+# ── АНОНИМНЫЕ КОММЕНТАРИИ ─────────────────
+def get_animal_alias(user_id: int, post_msg_id: int) -> str:
+    """Генерирует псевдоним из 3 случайных эмодзи-животных, уникальный для каждого (user, post)."""
+    import hashlib
+    seed_str = f"{user_id}:{post_msg_id}:alias_v1"
+    h = int(hashlib.sha256(seed_str.encode()).hexdigest(), 16)
+    n = len(ANIMAL_EMOJIS)
+    a = ANIMAL_EMOJIS[h % n]
+    b = ANIMAL_EMOJIS[(h // n) % n]
+    c = ANIMAL_EMOJIS[(h // n // n) % n]
+    return f"{a}{b}{c}"
+
+def save_comments(): _save_json(COMMENTS_FILE, anon_comments)
+
+def register_comment(post_msg_id: int, user_id: int, text: str) -> str:
+    """Сохраняет комментарий, возвращает псевдоним."""
+    key   = str(post_msg_id)
+    alias = get_animal_alias(user_id, post_msg_id)
+    if key not in anon_comments:
+        anon_comments[key] = {}
+    uid_str = str(user_id)
+    if uid_str not in anon_comments[key]:
+        anon_comments[key][uid_str] = {"alias": alias, "messages": []}
+    anon_comments[key][uid_str]["messages"].append({
+        "text": text,
+        "timestamp": datetime.now().isoformat(),
+    })
+    save_comments()
+    return alias
+
+def get_comments_for_post(post_msg_id: int) -> list[dict]:
+    """Возвращает все комментарии поста в хронологическом порядке."""
+    key = str(post_msg_id)
+    if key not in anon_comments:
+        return []
+    result = []
+    for uid_str, data in anon_comments[key].items():
+        alias = data["alias"]
+        for msg in data["messages"]:
+            result.append({"alias": alias, "text": msg["text"], "timestamp": msg["timestamp"]})
+    result.sort(key=lambda x: x["timestamp"])
+    return result
 
 # ── GROQ API ──────────────────────────────
 async def _groq_request(payload, retries=2):
@@ -266,8 +312,10 @@ async def _groq_request(payload, retries=2):
     async with httpx.AsyncClient(timeout=30.0) as client:
         for attempt in range(retries + 1):
             try:
-                r = await client.post("https://api.groq.com/openai/v1/chat/completions",
-                                      headers=headers, json=payload)
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers, json=payload
+                )
                 if r.status_code == 429 and attempt < retries:
                     await asyncio.sleep(2 ** attempt); continue
                 return r.json() if r.status_code == 200 else None
@@ -282,7 +330,8 @@ async def call_groq_simple(prompt, system, as_json=False):
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
-        "temperature": 0.1 if as_json else 0.9, "max_tokens": 256,
+        "temperature": 0.1 if as_json else 0.9,
+        "max_tokens": 256,
     }
     if as_json: payload["response_format"] = {"type":"json_object"}
     try:
@@ -303,7 +352,9 @@ async def call_groq_with_context(uid: int, user_msg: str) -> str:
             history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
             if len(history) > 6: user_ai_context[uid] = history[-6:]
             return reply
-        except Exception as e: logger.error("Groq ctx: %s", e); return "⚠️ Ошибка сети."
+        except Exception as e:
+            logger.error("Groq ctx: %s", e)
+            return "⚠️ Ошибка сети."
 
 # ── ПРОВЕРКА КОНТЕНТА ─────────────────────
 async def is_content_acceptable(text: str) -> tuple[bool, str]:
@@ -311,60 +362,105 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
     res = await call_groq_simple(text, CONTENT_CHECK_PROMPT, as_json=True)
     if not res: return True, ""
     try:
-        p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
+        p  = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
         ok = bool(p.get("acceptable", False))
         return ok, ("" if ok else p.get("reason",""))
     except: return True, ""
 
+# ── АНИМАЦИЯ ПЕЧАТАНИЯ ────────────────────
+async def typewriter_reply(update: Update, full_text: str):
+    if not full_text: return
+    msg       = await update.message.reply_text("▌")
+    displayed = ""
+    for i, ch in enumerate(full_text, 1):
+        displayed += ch
+        if i % UPDATE_INTERVAL == 0 or i == len(full_text):
+            cursor = "" if i == len(full_text) else "▌"
+            try: await msg.edit_text(displayed + cursor)
+            except: pass
+        await asyncio.sleep(TYPING_DELAY)
+
 # ── ОТПРАВКА В КАНАЛ ──────────────────────
 async def send_to_channel(context, update, text) -> int | None:
-    header       = "*📩 Анонимное сообщение*"
-    safe         = escape_mdv2(text) if text else ""
-    footer       = "> [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
-    caption      = f"{header}\n\n{safe}" if safe else header
+    header  = "*📩 Анонимное сообщение*"
+    safe    = escape_mdv2(text) if text else ""
+    footer  = "> [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
+    caption = f"{header}\n\n{safe}" if safe else header
     caption_full = f"{caption}\n\n{footer}"
 
-    msg = update.message; bot = context.bot
+    msg = update.message
+    bot = context.bot
     try:
         s = None
-        if msg.photo:       s = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id, caption=caption_full, parse_mode="MarkdownV2")
-        elif msg.video:     s = await bot.send_video(CHANNEL_ID, msg.video.file_id, caption=caption_full, parse_mode="MarkdownV2")
-        elif msg.animation: s = await bot.send_animation(CHANNEL_ID, msg.animation.file_id, caption=caption_full, parse_mode="MarkdownV2")
-        elif msg.audio:     s = await bot.send_audio(CHANNEL_ID, msg.audio.file_id, caption=caption_full, parse_mode="MarkdownV2")
-        elif msg.voice:     s = await bot.send_voice(CHANNEL_ID, msg.voice.file_id, caption=caption_full, parse_mode="MarkdownV2")
-        elif msg.document:  s = await bot.send_document(CHANNEL_ID, msg.document.file_id, caption=caption_full, parse_mode="MarkdownV2")
+        if msg.photo:
+            s = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id, caption=caption_full, parse_mode="MarkdownV2")
+        elif msg.video:
+            s = await bot.send_video(CHANNEL_ID, msg.video.file_id, caption=caption_full, parse_mode="MarkdownV2")
+        elif msg.animation:
+            s = await bot.send_animation(CHANNEL_ID, msg.animation.file_id, caption=caption_full, parse_mode="MarkdownV2")
+        elif msg.audio:
+            s = await bot.send_audio(CHANNEL_ID, msg.audio.file_id, caption=caption_full, parse_mode="MarkdownV2")
+        elif msg.voice:
+            s = await bot.send_voice(CHANNEL_ID, msg.voice.file_id, caption=caption_full, parse_mode="MarkdownV2")
+        elif msg.document:
+            s = await bot.send_document(CHANNEL_ID, msg.document.file_id, caption=caption_full, parse_mode="MarkdownV2")
         elif msg.sticker:
             s = await bot.send_sticker(CHANNEL_ID, msg.sticker.file_id)
             await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
-        elif msg.text:      s = await bot.send_message(CHANNEL_ID, caption_full, parse_mode="MarkdownV2")
-        else: return None
+        elif msg.text:
+            s = await bot.send_message(CHANNEL_ID, caption_full, parse_mode="MarkdownV2")
+        else:
+            return None
         return s.message_id if s else None
-    except Exception as e: logger.error("Канал: %s", e); return None
+    except Exception as e:
+        logger.error("Канал send_to_channel: %s", e)
+        return None
+
+# ── ПОСТ КОММЕНТАРИЕВ В ЧАТЕ ──────────────
+async def post_comment_invite(context, channel_msg_id: int):
+    """Публикует в привязанном чате приглашение с кнопкой — точно как на скрине."""
+    try:
+        bot_link = f"https://t.me/Shkola6_anonchik_bot?start=comment_{channel_msg_id}"
+        text = "🤖 Чтобы оставить анонимный комментарий к этому посту, нажмите на кнопку:"
+        kb   = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Написать анонимно", url=bot_link)
+        ]])
+        await context.bot.send_message(LINKED_CHAT_ID, text, reply_markup=kb)
+    except Exception as e:
+        logger.error("post_comment_invite: %s", e)
 
 # ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
 async def notify_admin_silent(context, update, ctype, ctext):
     u    = update.effective_user
+    # FIX: корректно отображаем username с любым регистром
     ustr = f"@{u.username}" if u.username else "—"
     name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "—"
+    # Экранируем для Markdown без лишних звёздочек
+    safe_ustr = ustr.replace("_","\_").replace("*","\*").replace("`","\`")
+    safe_name = name.replace("_","\_").replace("*","\*").replace("`","\`")
     lines = [
         "🕵️ *Новая анонимка*",
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
         f"👤 ID: `{u.id}`",
-        f"🔗 Username: {ustr.replace('`','').replace('*','')}",
-        f"📛 Имя: {name.replace('`','').replace('*','')}",
+        f"🔗 Username: {safe_ustr}",
+        f"📛 Имя: {safe_name}",
         f"📎 Тип: {ctype}",
     ]
-    if ctext: lines.append(f"💬 Текст:\n`{ctext[:300].replace('`', chr(39))}`")
-    try: await context.bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
-    except Exception as e: logger.error("Админ-уведомление: %s", e)
+    if ctext:
+        safe_text = ctext[:300].replace("`", "'")
+        lines.append(f"💬 Текст:\n`{safe_text}`")
+    try:
+        await context.bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error("Админ-уведомление: %s", e)
 
 # ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✉️  Отправить анонимку",  callback_data="menu_anon")],
-        [InlineKeyboardButton("🏆  Топ анонимщиков",     callback_data="menu_top")],
-        [InlineKeyboardButton("🤖  Поболтать с ИИ",      callback_data="menu_ai")],
-        [InlineKeyboardButton("❓  Помощь",               callback_data="menu_help")],
+        [InlineKeyboardButton("✉️  Отправить анонимку",    callback_data="menu_anon")],
+        [InlineKeyboardButton("🏆  Топ анонимщиков",       callback_data="menu_top")],
+        [InlineKeyboardButton("🤖  Поболтать с ИИ",        callback_data="menu_ai")],
+        [InlineKeyboardButton("❓  Помощь",                 callback_data="menu_help")],
     ])
 
 def top_keyboard(uid):
@@ -409,20 +505,47 @@ MENU_TEXT = (
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     kb = main_keyboard()
     if edit and update.callback_query:
-        try: await update.callback_query.edit_message_text(MENU_TEXT, reply_markup=kb)
-        except: await context.bot.send_message(update.effective_chat.id, MENU_TEXT, reply_markup=kb)
+        try:
+            await update.callback_query.edit_message_text(MENU_TEXT, reply_markup=kb)
+        except:
+            await context.bot.send_message(update.effective_chat.id, MENU_TEXT, reply_markup=kb)
     else:
         await update.message.reply_text(MENU_TEXT, reply_markup=kb)
 
 # ── КОМАНДЫ ───────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
+    u    = update.effective_user
+    args = context.args  # список аргументов после /start
+
     add_start_log(u.id, u.username, u.first_name, u.last_name)
     context.user_data.clear()
+
+    # Обработка deeplink для анонимных комментариев
+    if args and args[0].startswith("comment_"):
+        try:
+            post_msg_id = int(args[0].split("_", 1)[1])
+            context.user_data["state"]           = COMMENT_MODE
+            context.user_data["comment_post_id"] = post_msg_id
+            alias = get_animal_alias(u.id, post_msg_id)
+            ch    = str(CHANNEL_ID).replace("-100", "")
+            post_link = f"https://t.me/c/{ch}/{post_msg_id}"
+            await update.message.reply_text(
+                f"💬 *Анонимный комментарий*\n\n"
+                f"Твой псевдоним для этого поста: *{alias}*\n\n"
+                f"Напиши свой комментарий 👇\n"
+                f"(он появится в чате анонимно)",
+                parse_mode="Markdown",
+                reply_markup=back_keyboard("menu_back"),
+            )
+            return
+        except (ValueError, IndexError):
+            pass  # если deeplink кривой — просто показываем меню
+
     await update.message.reply_text(
         "🌟 *Добро пожаловать!*\n\n"
         "Этот бот позволяет тебе:\n\n"
         "✉️  Отправлять анонимки в канал\n"
+        "💬  Оставлять анонимные комментарии\n"
         "🏆  Участвовать в топе анонимщиков\n"
         "🤖  Общаться с ИИ\n\n"
         "Всё анонимно — никто не узнает 🔒",
@@ -430,24 +553,36 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(),
     )
 
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    popped = (context.user_data.pop("awaiting_broadcast", None)
+              or context.user_data.pop("awaiting_ids", None))
+    await update.message.reply_text("✅ Отменено." if popped else "Нечего отменять.")
+
 # ── АДМИН-ПАНЕЛЬ ──────────────────────────
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩  Анонимки",     callback_data="admin_tab_messages"),
-         InlineKeyboardButton("👥  Пользователи", callback_data="admin_tab_starts")],
-        [InlineKeyboardButton("📣  Рассылка",     callback_data="admin_broadcast"),
-         InlineKeyboardButton("🏆  Топ",          callback_data="admin_view_top")],
-        [InlineKeyboardButton("➕  Добавить ID",  callback_data="admin_add_ids"),
-         InlineKeyboardButton("📋  Список ID",    callback_data="admin_list_ids")],
-        [InlineKeyboardButton("📤  Экспорт CSV",  callback_data="admin_export"),
-         InlineKeyboardButton("🧹  Удалить >7д",  callback_data="admin_clean_old")],
+        [InlineKeyboardButton("📩  Анонимки",         callback_data="admin_tab_messages"),
+         InlineKeyboardButton("💬  Комментарии",      callback_data="admin_tab_comments")],
+        [InlineKeyboardButton("👥  Пользователи",     callback_data="admin_tab_starts"),
+         InlineKeyboardButton("🏆  Топ",              callback_data="admin_view_top")],
+        [InlineKeyboardButton("📣  Рассылка",         callback_data="admin_broadcast"),
+         InlineKeyboardButton("➕  Добавить ID",      callback_data="admin_add_ids")],
+        [InlineKeyboardButton("📋  Список ID",        callback_data="admin_list_ids"),
+         InlineKeyboardButton("📤  Экспорт CSV",      callback_data="admin_export")],
+        [InlineKeyboardButton("🧹  Удалить >7д",      callback_data="admin_clean_old")],
     ])
 
 def admin_text():
+    total_comments = sum(
+        sum(len(u["messages"]) for u in post.values())
+        for post in anon_comments.values()
+    )
     return (
         "👑 АДМИН-ПАНЕЛЬ\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"📩  Всего анонимок:      {len(message_logs)}\n"
+        f"💬  Всего комментариев:  {total_comments}\n"
         f"👥  Всего пользователей: {len(start_logs)}\n"
         f"🏆  В топе сейчас:       {len(get_top_entries())}\n"
         f"📅  Текущая неделя:      {current_week_key()}\n"
@@ -456,67 +591,100 @@ def admin_text():
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔️ Доступ запрещён."); return
+        await update.message.reply_text("⛔️ Доступ запрещён.")
+        return
     await update.message.reply_text(admin_text(), reply_markup=admin_keyboard())
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data  = query.data
     if update.effective_user.id != ADMIN_ID:
-        await query.edit_message_text("⛔️ Доступ запрещён."); return
+        await query.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
 
     if data == "admin_broadcast":
         context.user_data["awaiting_broadcast"] = True
         await query.edit_message_text(
             "📣 *Рассылка*\n\nВведи текст — получат все пользователи.\n\n/cancel — отмена",
             parse_mode="Markdown")
+
     elif data == "admin_add_ids":
         context.user_data["awaiting_ids"] = True
         await query.edit_message_text(
             "➕ *Добавление ID*\n\nОтправь числовые ID через пробел или запятую.\n\n/cancel — отмена",
             parse_mode="Markdown")
+
     elif data == "admin_list_ids":
         ids = ", ".join(str(i) for i in manual_ids) if manual_ids else "пусто"
-        await query.edit_message_text(f"📋 *Список ID:*\n\n{ids}", parse_mode="Markdown",
-                                      reply_markup=back_keyboard("admin_back"))
+        await query.edit_message_text(
+            f"📋 *Список ID:*\n\n{ids}",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_back"))
+
     elif data == "admin_view_top":
         entries = get_top_entries()
-        M = ["🥇","🥈","🥉"]
-        lines = ["🏆 *Топ анонимщиков*\n"]
-        if not entries: lines.append("Пока пусто 😶")
+        M       = ["🥇","🥈","🥉"]
+        lines   = ["🏆 *Топ анонимщиков*\n"]
+        if not entries:
+            lines.append("Пока пусто 😶")
         else:
             for i, e in enumerate(entries[:10]):
                 m = M[i] if i < 3 else f"{i+1}\\."
                 lines.append(f"{m} *{e['nick']}* — {e['count']} анонимок\n`ID: {e['user_id']}`")
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown",
-                                      reply_markup=back_keyboard("admin_back"))
-    elif data == "admin_tab_messages": await show_message_logs_page(query, 0)
-    elif data == "admin_tab_starts":   await show_start_logs_page(query, 0)
-    elif data == "admin_export":       await export_logs_csv(query)
-    elif data == "admin_clean_old":    await clean_old_logs(query)
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_back"))
+
+    elif data == "admin_tab_messages":
+        await show_message_logs_page(query, 0)
+
+    elif data == "admin_tab_starts":
+        await show_start_logs_page(query, 0)
+
+    elif data == "admin_tab_comments":
+        await show_comments_page(query, 0)
+
+    elif data == "admin_export":
+        await export_logs_csv(query)
+
+    elif data == "admin_clean_old":
+        await clean_old_logs(query)
+
     elif data == "admin_back":
         await query.edit_message_text(admin_text(), reply_markup=admin_keyboard())
+
     elif data.startswith("msg_page_"):
         await show_message_logs_page(query, int(data.rsplit("_",1)[-1]))
+
     elif data.startswith("start_page_"):
         await show_start_logs_page(query, int(data.rsplit("_",1)[-1]))
+
+    elif data.startswith("comm_page_"):
+        await show_comments_page(query, int(data.rsplit("_",1)[-1]))
+
     elif data == "msg_clear":
-        message_logs.clear(); _save_json(LOG_FILE, message_logs)
+        message_logs.clear()
+        _save_json(LOG_FILE, message_logs)
         await query.edit_message_text("🧹 Логи анонимок очищены.", reply_markup=admin_keyboard())
+
     elif data == "start_clear":
-        start_logs.clear(); _save_json(START_LOG_FILE, start_logs)
+        start_logs.clear()
+        _save_json(START_LOG_FILE, start_logs)
         await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=admin_keyboard())
+
     else:
         await query.edit_message_text("Неизвестная команда.")
 
-# ── ОБРАБОТЧИК СООБЩЕНИЙ ──────────────────
+# ── ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ ─────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
+    # --- ожидаем ник для топа ---
     if context.user_data.get("awaiting_top_nick"):
         nick = (update.message.text or "").strip()
         if not nick or len(nick) > 32:
-            await update.message.reply_text("⚠️ Ник: 1–32 символа. Попробуй ещё раз:"); return
+            await update.message.reply_text("⚠️ Ник: 1–32 символа. Попробуй ещё раз:")
+            return
         join_top(uid, nick)
         context.user_data.pop("awaiting_top_nick", None)
         count = top_data.get(str(uid), {}).get("count", 0)
@@ -528,39 +696,58 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=top_keyboard(uid))
         return
 
+    # --- добавление ID (админ) ---
     if context.user_data.get("awaiting_ids") and uid == ADMIN_ID:
-        text = (update.message.text or "").strip()
+        text    = (update.message.text or "").strip()
         new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
         if not new_ids:
-            await update.message.reply_text("Не найдено числовых ID. Попробуй снова."); return
-        added = [str(n) for n in new_ids if n not in manual_ids and not manual_ids.append(n)]
-        if added: save_manual_ids(manual_ids); await update.message.reply_text(f"✅ Добавлены: {', '.join(added)}")
-        else: await update.message.reply_text("⚠️ Все эти ID уже есть.")
-        context.user_data.pop("awaiting_ids", None); return
+            await update.message.reply_text("Не найдено числовых ID. Попробуй снова.")
+            return
+        added = []
+        for n in new_ids:
+            if n not in manual_ids:
+                manual_ids.append(n)
+                added.append(str(n))
+        if added:
+            save_manual_ids(manual_ids)
+            await update.message.reply_text(f"✅ Добавлены: {', '.join(added)}")
+        else:
+            await update.message.reply_text("⚠️ Все эти ID уже есть.")
+        context.user_data.pop("awaiting_ids", None)
+        return
 
+    # --- рассылка (админ) ---
     if context.user_data.get("awaiting_broadcast") and uid == ADMIN_ID:
         txt = update.message.text
-        if not txt: await update.message.reply_text("Сообщение не может быть пустым."); return
+        if not txt:
+            await update.message.reply_text("Сообщение не может быть пустым.")
+            return
         context.user_data.pop("awaiting_broadcast", None)
         all_ids = list(set(e["user_id"] for e in start_logs) | set(manual_ids))
-        if not all_ids: await update.message.reply_text("📭 Нет получателей."); return
+        if not all_ids:
+            await update.message.reply_text("📭 Нет получателей.")
+            return
         await update.message.reply_text(f"📣 Рассылка для {len(all_ids)} чел...")
         sent = failed = 0
         for i in all_ids:
-            try: await context.bot.send_message(i, txt); sent += 1; await asyncio.sleep(0.05)
-            except: failed += 1
+            try:
+                await context.bot.send_message(i, txt)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except:
+                failed += 1
         await update.message.reply_text(f"✅ Готово!\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}")
         return
 
     state = context.user_data.get("state")
-    if state == ANONYMOUS_MODE:   await handle_anonymous(update, context)
-    elif state == AI_CHAT_MODE:   await handle_ai_chat(update, context)
-    else:                          await main_menu(update, context)
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    popped = context.user_data.pop("awaiting_broadcast", None) or context.user_data.pop("awaiting_ids", None)
-    await update.message.reply_text("✅ Отменено." if popped else "Нечего отменять.")
+    if state == ANONYMOUS_MODE:
+        await handle_anonymous(update, context)
+    elif state == AI_CHAT_MODE:
+        await handle_ai_chat(update, context)
+    elif state == COMMENT_MODE:
+        await handle_comment(update, context)
+    else:
+        await main_menu(update, context)
 
 # ── АНОНИМКА ──────────────────────────────
 async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -570,7 +757,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     last = user_last_time.get(uid)
     if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
-        rem = int(COOLDOWN_SECONDS - (now - last).total_seconds())
+        rem  = int(COOLDOWN_SECONDS - (now - last).total_seconds())
         m, s = divmod(rem, 60)
         await update.message.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
         return
@@ -578,35 +765,47 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.strip():
         ok, reason = await is_content_acceptable(text)
         if not ok:
-            add_message_log({"user_id": uid, "username": update.effective_user.username,
-                             "first_name": update.effective_user.first_name,
-                             "last_name": update.effective_user.last_name,
-                             "content_type": "текст", "text": text,
-                             "timestamp": now.isoformat(), "blocked": reason})
+            add_message_log({
+                "user_id": uid, "username": update.effective_user.username,
+                "first_name": update.effective_user.first_name,
+                "last_name":  update.effective_user.last_name,
+                "content_type": "текст", "text": text,
+                "timestamp": now.isoformat(), "blocked": reason,
+            })
             await update.message.reply_text(
                 f"🚫 *Сообщение не принято*\n\nПричина: {reason}",
-                parse_mode="Markdown"); return
+                parse_mode="Markdown")
+            return
 
     mid = await send_to_channel(context, update, text)
     if mid is None:
-        await update.message.reply_text("❌ Не удалось отправить. Попробуй позже."); return
+        await update.message.reply_text("❌ Не удалось отправить. Попробуй позже.")
+        return
 
     user_last_time[uid] = now
-    msg = update.message
-    ctype = ("фото" if msg.photo else "видео" if msg.video else "GIF" if msg.animation
-             else "аудио" if msg.audio else "голосовое" if msg.voice
-             else "документ" if msg.document else "стикер" if msg.sticker else "текст")
+    msg   = update.message
+    ctype = ("фото"     if msg.photo     else
+             "видео"    if msg.video     else
+             "GIF"      if msg.animation else
+             "аудио"    if msg.audio     else
+             "голосовое" if msg.voice    else
+             "документ" if msg.document  else
+             "стикер"   if msg.sticker   else "текст")
 
-    add_message_log({"user_id": uid, "username": update.effective_user.username,
-                     "first_name": update.effective_user.first_name,
-                     "last_name": update.effective_user.last_name,
-                     "content_type": ctype, "text": text,
-                     "timestamp": now.isoformat(), "channel_msg_id": mid})
+    add_message_log({
+        "user_id": uid, "username": update.effective_user.username,
+        "first_name": update.effective_user.first_name,
+        "last_name":  update.effective_user.last_name,
+        "content_type": ctype, "text": text,
+        "timestamp": now.isoformat(), "channel_msg_id": mid,
+    })
 
-    # Засчитываем в топ ПОСЛЕ записи в лог
     increment_top(uid)
-
     await notify_admin_silent(context, update, ctype, text)
+
+    # Публикуем кнопку для анонимных комментариев в привязанном чате
+    await post_comment_invite(context, mid)
+
     await update.message.reply_text(
         "✅ *Анонимка отправлена!*\n\n"
         "Твоё сообщение опубликовано в канале 🎉\n"
@@ -614,20 +813,95 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=after_anon_keyboard())
 
+# ── АНОНИМНЫЙ КОММЕНТАРИЙ ─────────────────
+async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid         = update.effective_user.id
+    post_msg_id = context.user_data.get("comment_post_id")
+    text        = (update.message.text or "").strip()
+    now         = datetime.now()
+
+    if not post_msg_id:
+        await update.message.reply_text("❌ Пост не найден. Вернись через ссылку из чата.")
+        context.user_data.pop("state", None)
+        return
+
+    if not text:
+        await update.message.reply_text("⚠️ Комментарий должен быть текстовым.")
+        return
+
+    # Кулдаун для комментариев
+    last = user_comment_time.get(uid)
+    if last and (now - last).total_seconds() < COMMENT_COOLDOWN:
+        rem = int(COMMENT_COOLDOWN - (now - last).total_seconds())
+        await update.message.reply_text(f"⏳ Подожди ещё {rem} сек. перед следующим комментарием.")
+        return
+
+    # Проверка контента
+    ok, reason = await is_content_acceptable(text)
+    if not ok:
+        await update.message.reply_text(
+            f"🚫 *Комментарий не принят*\n\nПричина: {reason}",
+            parse_mode="Markdown")
+        return
+
+    alias = register_comment(post_msg_id, uid, text)
+    user_comment_time[uid] = now
+
+    # Отправляем в чат — псевдоним как цитата (blockquote), потом текст
+    # Формат как на скрине: > 🐶🦊🐼\nтекст
+    try:
+        await context.bot.send_message(
+            LINKED_CHAT_ID,
+            f">{alias}\n{text}",
+            parse_mode="MarkdownV2",
+        )
+    except Exception as e:
+        logger.error("Отправка комментария в чат: %s", e)
+        # Fallback без форматирования
+        try:
+            await context.bot.send_message(
+                LINKED_CHAT_ID,
+                f"{alias}\n{text}",
+            )
+        except Exception as e2:
+            logger.error("Fallback отправки комментария: %s", e2)
+            await update.message.reply_text("❌ Не удалось опубликовать комментарий. Попробуй позже.")
+            return
+
+    await update.message.reply_text(
+        f"✅ *Комментарий опубликован!*\n\n"
+        f"Твой псевдоним: *{alias}*\n"
+        f"Никто не знает что это ты 🔒\n\n"
+        f"Хочешь написать ещё?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Ещё комментарий", callback_data="comment_again")],
+            [InlineKeyboardButton("🏠 Главное меню",    callback_data="menu_back")],
+        ]))
+
 # ── ИИ-ЧАТ ───────────────────────────────
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text
-    if not inp: await update.message.reply_text("В режиме ИИ принимается только текст."); return
+    if not inp:
+        await update.message.reply_text("В режиме ИИ принимается только текст.")
+        return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     res = await call_groq_with_context(update.effective_user.id, inp)
     await typewriter_reply(update, res or "⚠️ ИИ временно недоступен.")
 
-# ── КНОПКИ ────────────────────────────────
+# ── КНОПКИ (основной обработчик) ──────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     uid  = update.effective_user.id
+
+    # Делегируем админские коллбэки
+    if (data.startswith("admin_") or data.startswith("msg_page_")
+            or data.startswith("start_page_") or data.startswith("comm_page_")
+            or data in ("msg_clear","start_clear","comm_clear")):
+        await admin_callback(update, context)
+        return
 
     if data == "menu_anon":
         context.user_data["state"] = ANONYMOUS_MODE
@@ -643,13 +917,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(build_top_text(), reply_markup=top_keyboard(uid))
 
     elif data == "top_refresh":
-        try: await query.edit_message_text(build_top_text(), reply_markup=top_keyboard(uid))
+        try:
+            await query.edit_message_text(build_top_text(), reply_markup=top_keyboard(uid))
         except: pass
 
     elif data == "top_join":
         context.user_data["awaiting_top_nick"] = True
         already = is_in_top(uid)
-        hint = "Введи *новый ник* чтобы обновить:" if already else "Введи *ник* — он будет виден всем в рейтинге:"
+        hint = ("Введи *новый ник* чтобы обновить:" if already
+                else "Введи *ник* — он будет виден всем в рейтинге:")
         await query.edit_message_text(
             f"✍️ *Ник для топа*\n\n{hint}\n\n"
             "Это может быть прозвище, псевдоним — что угодно 😎\n"
@@ -677,9 +953,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✉️ *Анонимка*\n"
             "Отправь любое сообщение — оно выйдет в канале без твоего имени.\n"
             "Поддерживаются: текст, фото, видео, голос, GIF, стикер.\n\n"
+            "💬 *Анонимные комментарии*\n"
+            "Под каждым постом в чате появляется кнопка.\n"
+            "Нажми её — получишь рандомный псевдоним из эмодзи-животных.\n"
+            "Псевдоним уникален для каждого поста!\n\n"
             "🏆 *Топ анонимщиков*\n"
-            "Еженедельный рейтинг. Каждая отправленная анонимка\n"
-            "добавляет +1 к твоему счёту. Сброс каждый понедельник.\n\n"
+            "Еженедельный рейтинг. Каждая анонимка = +1 к счёту.\n\n"
             "🤖 *ИИ-чат*\n"
             "Общайся с искусственным интеллектом на любую тему.\n\n"
             "/start — вернуться в главное меню",
@@ -688,6 +967,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "menu_back":
         context.user_data.pop("state", None)
+        context.user_data.pop("comment_post_id", None)
         await main_menu(update, context, edit=True)
 
     elif data == "ai_reset":
@@ -700,24 +980,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = ANONYMOUS_MODE
         await query.edit_message_text("✉️ Режим анонимки.\n\nОтправь следующее сообщение 👇")
 
-    elif (data.startswith("admin_") or data.startswith("msg_page_")
-          or data.startswith("start_page_") or data in ("msg_clear","start_clear")):
-        await admin_callback(update, context)
+    elif data == "comment_again":
+        # Остаёмся в режиме комментариев — просто говорим пиши ещё
+        post_msg_id = context.user_data.get("comment_post_id")
+        alias       = get_animal_alias(uid, post_msg_id) if post_msg_id else "?"
+        await query.edit_message_text(
+            f"💬 *Режим комментариев*\n\n"
+            f"Твой псевдоним: *{alias}*\n\n"
+            f"Напиши следующий комментарий 👇",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("menu_back"))
 
     else:
         await query.edit_message_text("Неизвестная команда. Используй /start.")
 
 # ── ЛОГИ / ПАГИНАЦИЯ ─────────────────────
 def _paginate(items, page, per=5):
-    total = max(1, (len(items)+per-1)//per)
-    page  = max(0, min(page, total-1))
+    total = max(1, (len(items) + per - 1) // per)
+    page  = max(0, min(page, total - 1))
     return items[page*per:(page+1)*per], total
 
 def _nav(page, total, prefix, clear_cb, end=False):
     nav = []
-    if page > 0:       nav.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}{page-1}"))
-    if page < total-1: nav.append(InlineKeyboardButton("▶️", callback_data=f"{prefix}{page+1}"))
-    if end and total > 1 and page < total-1:
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}{page-1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"{prefix}{page+1}"))
+    if end and total > 1 and page < total - 1:
         nav.append(InlineKeyboardButton("⏭", callback_data=f"{prefix}{total-1}"))
     rows = []
     if nav: rows.append(nav)
@@ -727,60 +1016,130 @@ def _nav(page, total, prefix, clear_cb, end=False):
 
 async def show_message_logs_page(query, page):
     if not message_logs:
-        await query.edit_message_text("📭 Нет анонимных сообщений.",
-                                      reply_markup=_nav(0,1,"msg_page_","msg_clear")); return
+        await query.edit_message_text(
+            "📭 Нет анонимных сообщений.",
+            reply_markup=_nav(0, 1, "msg_page_", "msg_clear"))
+        return
     items, total = _paginate(message_logs, page)
     lines = [f"📩 Анонимки — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
     for i, e in enumerate(items, page*5+1):
         dt   = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
-        ustr = (f"@{e.get('username')}" if e.get("username")
-                else f"{e.get('first_name','') or ''} {e.get('last_name','') or ''}".strip() or "—")
+        # FIX: username с любым регистром — просто берём как строку без Markdown-форматирования
+        uname = e.get("username") or ""
+        fname = (e.get("first_name") or "")
+        lname = (e.get("last_name") or "")
+        if uname:
+            ustr = f"@{uname}"
+        elif fname or lname:
+            ustr = f"{fname} {lname}".strip()
+        else:
+            ustr = "—"
         snip = (e.get("text") or "")[:60] or "—"
         blk  = e.get("blocked")
         ico  = "🚫" if blk else "✅"
         mid  = e.get("channel_msg_id")
         if mid and not blk:
-            ch = str(CHANNEL_ID).replace("-100","")
+            ch   = str(CHANNEL_ID).replace("-100","")
             link = f"[🔗 открыть](https://t.me/c/{ch}/{mid})"
         else:
             link = f"🚫 {blk}" if blk else "—"
-        lines.append(f"{ico} *{i}.* {dt}\n👤 `{e['user_id']}` {ustr}\n📎 {e.get('content_type','текст')}: {snip}\n{link}")
-    await query.edit_message_text("\n\n".join(lines), parse_mode="Markdown",
-                                  reply_markup=_nav(page, total, "msg_page_", "msg_clear", end=True),
-                                  disable_web_page_preview=True)
+        # Экранируем только спецсимволы в именах для Markdown
+        safe_ustr = ustr.replace("_", "\\_").replace("*","\\*").replace("[","\\[")
+        lines.append(
+            f"{ico} *{i}.* {dt}\n"
+            f"👤 `{e['user_id']}` {safe_ustr}\n"
+            f"📎 {e.get('content_type','текст')}: {snip}\n"
+            f"{link}"
+        )
+    await query.edit_message_text(
+        "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_nav(page, total, "msg_page_", "msg_clear", end=True),
+        disable_web_page_preview=True)
 
 async def show_start_logs_page(query, page):
     if not start_logs:
-        await query.edit_message_text("📭 Нет записей.",
-                                      reply_markup=_nav(0,1,"start_page_","start_clear")); return
+        await query.edit_message_text(
+            "📭 Нет записей.",
+            reply_markup=_nav(0, 1, "start_page_", "start_clear"))
+        return
     items, total = _paginate(start_logs, page)
     lines = [f"👥 Пользователи — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
     for i, e in enumerate(items, page*5+1):
+        dt    = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+        uname = e.get("username") or ""
+        fname = (e.get("first_name") or "")
+        lname = (e.get("last_name") or "")
+        if uname:
+            ustr = f"@{uname}"
+        elif fname or lname:
+            ustr = f"{fname} {lname}".strip()
+        else:
+            ustr = "—"
+        safe_ustr = ustr.replace("_", "\\_").replace("*","\\*").replace("[","\\[")
+        lines.append(f"*{i}.* {dt}\n👤 `{e['user_id']}` {safe_ustr}")
+    await query.edit_message_text(
+        "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_nav(page, total, "start_page_", "start_clear"))
+
+async def show_comments_page(query, page):
+    """Показывает анонимные комментарии по постам."""
+    # Собираем все комментарии плоским списком
+    all_comments = []
+    for post_id, users in anon_comments.items():
+        for uid_str, data in users.items():
+            alias = data["alias"]
+            for msg in data["messages"]:
+                all_comments.append({
+                    "post_id": post_id,
+                    "alias": alias,
+                    "text": msg["text"],
+                    "timestamp": msg["timestamp"],
+                })
+    all_comments.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    if not all_comments:
+        await query.edit_message_text(
+            "📭 Нет анонимных комментариев.",
+            reply_markup=_nav(0, 1, "comm_page_", "comm_clear"))
+        return
+
+    items, total = _paginate(all_comments, page)
+    lines = [f"💬 Комментарии — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
+    ch = str(CHANNEL_ID).replace("-100","")
+    for i, e in enumerate(items, page*5+1):
         dt   = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
-        ustr = (f"@{e.get('username')}" if e.get("username")
-                else f"{e.get('first_name','') or ''} {e.get('last_name','') or ''}".strip() or "—")
-        lines.append(f"*{i}.* {dt}\n👤 `{e['user_id']}` {ustr}")
-    await query.edit_message_text("\n\n".join(lines), parse_mode="Markdown",
-                                  reply_markup=_nav(page, total, "start_page_", "start_clear"))
+        snip = e["text"][:80]
+        link = f"[пост](https://t.me/c/{ch}/{e['post_id']})"
+        lines.append(f"*{i}.* {dt}\n{e['alias']} → {link}\n💬 {snip}")
+    await query.edit_message_text(
+        "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_nav(page, total, "comm_page_", "comm_clear"),
+        disable_web_page_preview=True)
 
 async def export_logs_csv(query):
     buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=["user_id","username","first_name","last_name",
-                                         "content_type","text","timestamp"])
+    w   = csv.DictWriter(buf, fieldnames=["user_id","username","first_name","last_name",
+                                          "content_type","text","timestamp"])
     w.writeheader()
-    for row in message_logs: w.writerow({k: row.get(k,"") for k in w.fieldnames})
-    f = io.BytesIO(buf.getvalue().encode("utf-8-sig")); f.name = "logs.csv"
+    for row in message_logs:
+        w.writerow({k: row.get(k, "") for k in w.fieldnames})
+    f = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    f.name = "logs.csv"
     await query.message.reply_document(document=f, filename="logs.csv", caption="📤 Экспорт логов")
 
 async def clean_old_logs(query):
     global message_logs
-    cutoff = datetime.now().timestamp() - 7*86400
+    cutoff = datetime.now().timestamp() - 7 * 86400
     before = len(message_logs)
     message_logs = [e for e in message_logs
                     if datetime.fromisoformat(e["timestamp"]).timestamp() > cutoff]
     _save_json(LOG_FILE, message_logs)
-    await query.edit_message_text(f"🧹 Удалено {before-len(message_logs)} записей старше 7 дней.",
-                                  reply_markup=admin_keyboard())
+    await query.edit_message_text(
+        f"🧹 Удалено {before - len(message_logs)} записей старше 7 дней.",
+        reply_markup=admin_keyboard())
 
 # ── ТОЧКА ВХОДА ───────────────────────────
 def main():
