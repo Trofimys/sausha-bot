@@ -31,7 +31,7 @@ if sys.platform == "win32":
 # КОНФИГУРАЦИЯ
 # ─────────────────────────────────────────
 BOT_TOKEN    = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
-CHANNEL_ID   = -1003951653487
+CHANNEL_ID   = -1003854171715      # Новый ID канала
 GROQ_API_KEY = "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"
 ADMIN_ID     = 8627543263
 
@@ -294,7 +294,6 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
 async def send_to_channel(context: ContextTypes.DEFAULT_TYPE, update: Update, text: str) -> int | None:
     header  = "*📩 Анонимное сообщение*"
     safe    = escape_mdv2(text) if text else ""
-    # 👇 ЦИТИРОВАННАЯ ссылка на бота
     footer  = "> [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
     caption = f"{header}\n\n{safe}" if safe else header
     caption_full = f"{caption}\n\n{footer}" if caption else footer
@@ -424,6 +423,54 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_start_log(user.id, user.username, user.first_name, user.last_name)
     context.user_data.clear()
     await main_menu(update, context)
+
+
+# ─────────────────────────────────────────
+# РАССЫЛКА ВСЕМ ПОЛЬЗОВАТЕЛЯМ (ADMIN)
+# ─────────────────────────────────────────
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Проверяем права
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    # Извлекаем текст: либо реплай на сообщение, либо текст после команды
+    target_message = None
+    if update.message.reply_to_message:
+        target_message = update.message.reply_to_message
+        text_to_send = target_message.text or target_message.caption or ""
+    else:
+        # Текст после команды, например /broadcast Привет всем!
+        text_to_send = update.message.text.split(" ", 1)[1] if len(update.message.text.split(" ", 1)) > 1 else None
+
+    if not text_to_send:
+        await update.message.reply_text(
+            "ℹ️ Используйте:\n"
+            "/broadcast <текст> — разослать текст\n"
+            "или ответьте на сообщение командой /broadcast"
+        )
+        return
+
+    # Получаем уникальных пользователей из start_logs
+    user_ids = set(entry["user_id"] for entry in start_logs)
+    if not user_ids:
+        await update.message.reply_text("📭 Нет пользователей для рассылки.")
+        return
+
+    await update.message.reply_text(f"📣 Начинаю рассылку для {len(user_ids)} пользователей...")
+
+    sent = 0
+    failed = 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=text_to_send)
+            sent += 1
+            await asyncio.sleep(0.05)  # небольшая задержка, чтобы не упереться в лимиты
+        except Exception as e:
+            logger.warning(f"Не удалось отправить пользователю {uid}: {e}")
+            failed += 1
+
+    await update.message.reply_text(f"✅ Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
 
 
 # ─────────────────────────────────────────
@@ -790,6 +837,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))  # новая команда
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
