@@ -443,8 +443,11 @@ async def send_to_channel(context, update, text) -> int | None:
 # ── ПОСТ КНОПКИ АНОНИМНОГО КОММЕНТАРИЯ В ЧАТ ──
 async def post_comment_invite(context, channel_msg_id: int):
     """
-    БАГ-ФИКС: Убран лишний try/except глотающий ошибки без логов.
-    Добавлена попытка с reply_to_message_id как fallback если тред не работает.
+    Отправляет кнопку анонимного комментария в связанный чат.
+    Стратегия попыток:
+      1. reply_to_message_id=channel_msg_id  — ответом на авто-форвард поста
+      2. message_thread_id=channel_msg_id    — в тред (если форвард уже стал тредом)
+      3. Без привязки                        — просто в чат
     """
     bot_link = f"https://t.me/Shkola6_anonchik_bot?start=comment_{channel_msg_id}"
     text = "🤖 Чтобы оставить анонимный комментарий к этому посту, нажми на кнопку:"
@@ -452,7 +455,20 @@ async def post_comment_invite(context, channel_msg_id: int):
         InlineKeyboardButton("💬 Написать анонимно", url=bot_link)
     ]])
 
-    # Попытка 1: отправить в тред поста (message_thread_id = channel_msg_id)
+    # Попытка 1: ответ на авто-форвард поста в чате (самый правильный способ)
+    try:
+        await context.bot.send_message(
+            LINKED_CHAT_ID,
+            text,
+            reply_markup=kb,
+            reply_to_message_id=channel_msg_id,
+        )
+        logger.info("post_comment_invite OK reply: channel_msg_id=%s", channel_msg_id)
+        return
+    except Exception as e:
+        logger.warning("post_comment_invite reply failed (%s): %s", channel_msg_id, e)
+
+    # Попытка 2: через message_thread_id (треды включены)
     try:
         await context.bot.send_message(
             LINKED_CHAT_ID,
@@ -463,16 +479,12 @@ async def post_comment_invite(context, channel_msg_id: int):
         logger.info("post_comment_invite OK thread: channel_msg_id=%s", channel_msg_id)
         return
     except Exception as e:
-        logger.warning("post_comment_invite thread failed (%s): %s — пробую без треда", channel_msg_id, e)
+        logger.warning("post_comment_invite thread failed (%s): %s", channel_msg_id, e)
 
-    # Попытка 2: без треда (для чатов без включённых обсуждений)
+    # Попытка 3: просто в чат без привязки
     try:
-        await context.bot.send_message(
-            LINKED_CHAT_ID,
-            text,
-            reply_markup=kb,
-        )
-        logger.info("post_comment_invite OK no-thread: channel_msg_id=%s", channel_msg_id)
+        await context.bot.send_message(LINKED_CHAT_ID, text, reply_markup=kb)
+        logger.info("post_comment_invite OK plain: channel_msg_id=%s", channel_msg_id)
     except Exception as e:
         logger.error("post_comment_invite totally failed (%s): %s", channel_msg_id, e)
 
@@ -896,8 +908,6 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     increment_top(uid)
     await notify_admin_silent(context, update, ctype, text)
 
-    # БАГ-ФИКС: ждём немного перед отправкой кнопки — тред в чате должен успеть создаться
-    await asyncio.sleep(1)
     await post_comment_invite(context, mid)
 
     await update.message.reply_text(
@@ -1311,8 +1321,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     channel_msg_id = post.message_id
     logger.info("Новый пост в канале: msg_id=%s", channel_msg_id)
-    # Небольшая задержка чтобы тред в связанном чате успел создаться
-    await asyncio.sleep(2)
     await post_comment_invite(context, channel_msg_id)
 
 
