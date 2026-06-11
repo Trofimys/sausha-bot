@@ -1250,6 +1250,18 @@ async def clean_old_logs(query):
         f"🧹 Удалено {before - len(message_logs)} записей старше 7 дней.",
         reply_markup=admin_keyboard())
 
+# ── ОБРАБОТЧИК ПОСТОВ ИЗ КАНАЛА ──────────
+# Срабатывает на ЛЮБОЙ пост в канале — в т.ч. опубликованный вручную админом
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    post = update.channel_post
+    if not post:
+        return
+    if post.chat.id != CHANNEL_ID:
+        return
+    channel_msg_id = post.message_id
+    logger.info("Новый пост в канале: msg_id=%s", channel_msg_id)
+    await post_comment_invite(context, channel_msg_id)
+
 # ── ТОЧКА ВХОДА ───────────────────────────
 def main():
     load_all_logs()
@@ -1258,9 +1270,12 @@ def main():
     app.add_handler(CommandHandler("admin",  cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(button_callback))
+    # Хендлер постов канала — ловит все посты из канала включая ручные
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
     logger.info("✅ Бот запущен!")
-    app.run_polling(drop_pending_updates=True)
+    # allowed_updates=Update.ALL_TYPES нужен чтобы получать channel_post апдейты
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
