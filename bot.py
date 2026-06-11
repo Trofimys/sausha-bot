@@ -27,26 +27,25 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-BOT_TOKEN    = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
-CHANNEL_ID   = -1003854171715
-LINKED_CHAT_ID = -1003718571364   # чат, привязанный к каналу (для комментариев)
-GROQ_API_KEY = "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"
-ADMIN_ID     = 8627543263
+BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
+CHANNEL_ID     = -1003854171715
+LINKED_CHAT_ID = -1003718571364
+GROQ_API_KEY   = "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"
+ADMIN_ID       = 8627543263
 
 LOG_FILE         = "anon_logs.json"
 START_LOG_FILE   = "start_logs.json"
 MANUAL_IDS_FILE  = "manual_ids.json"
 TOP_FILE         = "top_data.json"
-COMMENTS_FILE    = "anon_comments.json"   # БАЗ анонимных комментариев
+COMMENTS_FILE    = "anon_comments.json"
 
 COOLDOWN_SECONDS  = 180
-COMMENT_COOLDOWN  = 60   # кулдаун для комментариев — 1 мин
+COMMENT_COOLDOWN  = 60
 ANONYMOUS_MODE, AI_CHAT_MODE, COMMENT_MODE = 1, 2, 3
 TYPING_DELAY      = 0.015
 UPDATE_INTERVAL   = 5
 GROQ_SEMAPHORE    = asyncio.Semaphore(5)
 
-# Эмодзи-животные для псевдонимов
 ANIMAL_EMOJIS = [
     "🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯",
     "🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🦆","🦅",
@@ -65,7 +64,7 @@ message_logs:  list[dict] = []
 start_logs:    list[dict] = []
 manual_ids:    list[int]  = []
 top_data:      dict       = {}
-anon_comments: dict       = {}   # {post_msg_id: {user_id: {"alias": "...", "messages": [...]}}}
+anon_comments: dict       = {}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -265,7 +264,6 @@ def build_top_text() -> str:
 
 # ── АНОНИМНЫЕ КОММЕНТАРИИ ─────────────────
 def get_animal_alias(user_id: int, post_msg_id: int) -> str:
-    """Генерирует псевдоним из 3 случайных эмодзи-животных, уникальный для каждого (user, post)."""
     import hashlib
     seed_str = f"{user_id}:{post_msg_id}:alias_v1"
     h = int(hashlib.sha256(seed_str.encode()).hexdigest(), 16)
@@ -278,7 +276,6 @@ def get_animal_alias(user_id: int, post_msg_id: int) -> str:
 def save_comments(): _save_json(COMMENTS_FILE, anon_comments)
 
 def register_comment(post_msg_id: int, user_id: int, text: str) -> str:
-    """Сохраняет комментарий, возвращает псевдоним."""
     key   = str(post_msg_id)
     alias = get_animal_alias(user_id, post_msg_id)
     if key not in anon_comments:
@@ -294,7 +291,6 @@ def register_comment(post_msg_id: int, user_id: int, text: str) -> str:
     return alias
 
 def get_comments_for_post(post_msg_id: int) -> list[dict]:
-    """Возвращает все комментарии поста в хронологическом порядке."""
     key = str(post_msg_id)
     if key not in anon_comments:
         return []
@@ -417,25 +413,52 @@ async def send_to_channel(context, update, text) -> int | None:
         return None
 
 # ── ПОСТ КОММЕНТАРИЕВ В ЧАТЕ ──────────────
+# ИСПРАВЛЕНО: теперь отправляется как REPLY на пост в канале (reply_to_message_id)
 async def post_comment_invite(context, channel_msg_id: int):
-    """Публикует в привязанном чате приглашение с кнопкой — точно как на скрине."""
     try:
         bot_link = f"https://t.me/Shkola6_anonchik_bot?start=comment_{channel_msg_id}"
         text = "🤖 Чтобы оставить анонимный комментарий к этому посту, нажмите на кнопку:"
         kb   = InlineKeyboardMarkup([[
             InlineKeyboardButton("💬 Написать анонимно", url=bot_link)
         ]])
-        await context.bot.send_message(LINKED_CHAT_ID, text, reply_markup=kb)
+        await context.bot.send_message(
+            LINKED_CHAT_ID,
+            text,
+            reply_markup=kb,
+            reply_to_message_id=channel_msg_id,  # <- привязка к посту
+        )
     except Exception as e:
         logger.error("post_comment_invite: %s", e)
+
+# ── УВЕДОМЛЕНИЕ АВТОРА АНОНИМКИ ──────────
+# НОВОЕ: уведомляем автора, что кто-то написал комментарий под его постом
+async def notify_anon_author(context, post_msg_id: int, commenter_uid: int):
+    original_author_id = None
+    for entry in reversed(message_logs):
+        if entry.get("channel_msg_id") == post_msg_id and not entry.get("blocked"):
+            original_author_id = entry.get("user_id")
+            break
+    if not original_author_id or original_author_id == commenter_uid:
+        return
+    ch = str(CHANNEL_ID).replace("-100", "")
+    post_link = f"https://t.me/c/{ch}/{post_msg_id}"
+    try:
+        await context.bot.send_message(
+            original_author_id,
+            "💬 *Кто-то ответил на твою анонимку!*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("👀 Посмотреть", url=post_link)
+            ]])
+        )
+    except Exception as e:
+        logger.error("notify_anon_author: %s", e)
 
 # ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
 async def notify_admin_silent(context, update, ctype, ctext):
     u    = update.effective_user
-    # FIX: корректно отображаем username с любым регистром
     ustr = f"@{u.username}" if u.username else "—"
     name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "—"
-    # Экранируем для Markdown без лишних звёздочек
     safe_ustr = ustr.replace("_","\_").replace("*","\*").replace("`","\`")
     safe_name = name.replace("_","\_").replace("*","\*").replace("`","\`")
     lines = [
@@ -515,7 +538,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
 # ── КОМАНДЫ ───────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u    = update.effective_user
-    args = context.args  # список аргументов после /start
+    args = context.args
 
     add_start_log(u.id, u.username, u.first_name, u.last_name)
     context.user_data.clear()
@@ -527,19 +550,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["state"]           = COMMENT_MODE
             context.user_data["comment_post_id"] = post_msg_id
             alias = get_animal_alias(u.id, post_msg_id)
-            ch    = str(CHANNEL_ID).replace("-100", "")
-            post_link = f"https://t.me/c/{ch}/{post_msg_id}"
             await update.message.reply_text(
                 f"💬 *Анонимный комментарий*\n\n"
                 f"Твой псевдоним для этого поста: *{alias}*\n\n"
-                f"Напиши свой комментарий 👇\n"
-                f"(он появится в чате анонимно)",
+                f"Отправь текст, фото, видео, голосовое, GIF или стикер 👇\n"
+                f"(появится в чате анонимно)",
                 parse_mode="Markdown",
                 reply_markup=back_keyboard("menu_back"),
             )
             return
         except (ValueError, IndexError):
-            pass  # если deeplink кривой — просто показываем меню
+            pass
 
     await update.message.reply_text(
         "🌟 *Добро пожаловать!*\n\n"
@@ -672,6 +693,12 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_json(START_LOG_FILE, start_logs)
         await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=admin_keyboard())
 
+    # ИСПРАВЛЕНО: добавлен обработчик comm_clear, которого раньше не было — вызывал KeyError
+    elif data == "comm_clear":
+        anon_comments.clear()
+        save_comments()
+        await query.edit_message_text("🧹 Комментарии очищены.", reply_markup=admin_keyboard())
+
     else:
         await query.edit_message_text("Неизвестная команда.")
 
@@ -680,6 +707,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Игнорируем сообщения из привязанного чата и канала
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
+        return
+
+    # ИСПРАВЛЕНО: если update.message is None (например, edited_message) — выходим
+    if not update.message:
         return
 
     uid = update.effective_user.id
@@ -808,7 +839,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     increment_top(uid)
     await notify_admin_silent(context, update, ctype, text)
 
-    # Публикуем кнопку для анонимных комментариев в привязанном чате
+    # ИСПРАВЛЕНО: отправляем кнопку как reply под постом канала
     await post_comment_invite(context, mid)
 
     await update.message.reply_text(
@@ -822,59 +853,132 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid         = update.effective_user.id
     post_msg_id = context.user_data.get("comment_post_id")
-    text        = (update.message.text or "").strip()
+    msg         = update.message
+    text        = (msg.text or msg.caption or "").strip()
     now         = datetime.now()
 
     if not post_msg_id:
-        await update.message.reply_text("❌ Пост не найден. Вернись через ссылку из чата.")
+        await msg.reply_text("❌ Пост не найден. Вернись через ссылку из чата.")
         context.user_data.pop("state", None)
         return
 
-    if not text:
-        await update.message.reply_text("⚠️ Комментарий должен быть текстовым.")
+    # Проверяем что хоть что-то есть (текст или медиа)
+    has_media = bool(msg.photo or msg.video or msg.animation or
+                     msg.audio or msg.voice or msg.document or msg.sticker)
+    if not text and not has_media:
+        await msg.reply_text("⚠️ Отправь текст, фото, видео, голосовое, GIF или стикер.")
         return
 
-    # Кулдаун для комментариев
     last = user_comment_time.get(uid)
     if last and (now - last).total_seconds() < COMMENT_COOLDOWN:
         rem = int(COMMENT_COOLDOWN - (now - last).total_seconds())
-        await update.message.reply_text(f"⏳ Подожди ещё {rem} сек. перед следующим комментарием.")
+        await msg.reply_text(f"⏳ Подожди ещё {rem} сек. перед следующим комментарием.")
         return
 
-    # Проверка контента
-    ok, reason = await is_content_acceptable(text)
-    if not ok:
-        await update.message.reply_text(
-            f"🚫 *Комментарий не принят*\n\nПричина: {reason}",
-            parse_mode="Markdown")
-        return
+    # Проверка контента только для текста
+    if text:
+        ok, reason = await is_content_acceptable(text)
+        if not ok:
+            await msg.reply_text(
+                f"🚫 *Комментарий не принят*\n\nПричина: {reason}",
+                parse_mode="Markdown")
+            return
 
     alias = register_comment(post_msg_id, uid, text)
     user_comment_time[uid] = now
 
-    # Отправляем в чат — псевдоним как цитата (blockquote), потом текст
-    # Формат как на скрине: > 🐶🦊🐼\nтекст
+    # Формируем подпись: псевдоним как цитата + текст (если есть)
+    alias_escaped = escape_mdv2(alias)
+    text_escaped  = escape_mdv2(text) if text else ""
+    if text_escaped:
+        caption_mdv2 = f">{alias_escaped}\n{text_escaped}"
+        caption_plain = f"{alias}\n{text}"
+    else:
+        caption_mdv2  = f">{alias_escaped}"
+        caption_plain = alias
+
+    bot      = context.bot
+    sent_ok  = False
+    send_kwargs = dict(reply_to_message_id=post_msg_id)
+
     try:
-        await context.bot.send_message(
-            LINKED_CHAT_ID,
-            f">{alias}\n{text}",
-            parse_mode="MarkdownV2",
-        )
+        if msg.photo:
+            await bot.send_photo(LINKED_CHAT_ID, msg.photo[-1].file_id,
+                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
+        elif msg.video:
+            await bot.send_video(LINKED_CHAT_ID, msg.video.file_id,
+                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
+        elif msg.animation:
+            await bot.send_animation(LINKED_CHAT_ID, msg.animation.file_id,
+                                     caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
+        elif msg.audio:
+            await bot.send_audio(LINKED_CHAT_ID, msg.audio.file_id,
+                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
+        elif msg.voice:
+            await bot.send_voice(LINKED_CHAT_ID, msg.voice.file_id,
+                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
+        elif msg.document:
+            await bot.send_document(LINKED_CHAT_ID, msg.document.file_id,
+                                    caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
+        elif msg.sticker:
+            await bot.send_sticker(LINKED_CHAT_ID, msg.sticker.file_id, **send_kwargs)
+            # Для стикера псевдоним отправляем отдельным сообщением
+            await bot.send_message(LINKED_CHAT_ID, caption_plain, **send_kwargs)
+        else:
+            # Просто текст
+            await bot.send_message(LINKED_CHAT_ID, caption_mdv2,
+                                   parse_mode="MarkdownV2", **send_kwargs)
+        sent_ok = True
     except Exception as e:
-        logger.error("Отправка комментария в чат: %s", e)
-        # Fallback без форматирования
+        logger.error("Отправка комментария в чат (MDv2): %s", e)
+        # Fallback без MarkdownV2
         try:
-            await context.bot.send_message(
-                LINKED_CHAT_ID,
-                f"{alias}\n{text}",
-            )
+            if msg.photo:
+                await bot.send_photo(LINKED_CHAT_ID, msg.photo[-1].file_id,
+                                     caption=caption_plain, **send_kwargs)
+            elif msg.video:
+                await bot.send_video(LINKED_CHAT_ID, msg.video.file_id,
+                                     caption=caption_plain, **send_kwargs)
+            elif msg.animation:
+                await bot.send_animation(LINKED_CHAT_ID, msg.animation.file_id,
+                                         caption=caption_plain, **send_kwargs)
+            elif msg.audio:
+                await bot.send_audio(LINKED_CHAT_ID, msg.audio.file_id,
+                                     caption=caption_plain, **send_kwargs)
+            elif msg.voice:
+                await bot.send_voice(LINKED_CHAT_ID, msg.voice.file_id,
+                                     caption=caption_plain, **send_kwargs)
+            elif msg.document:
+                await bot.send_document(LINKED_CHAT_ID, msg.document.file_id,
+                                        caption=caption_plain, **send_kwargs)
+            elif msg.sticker:
+                await bot.send_sticker(LINKED_CHAT_ID, msg.sticker.file_id, **send_kwargs)
+                await bot.send_message(LINKED_CHAT_ID, caption_plain, **send_kwargs)
+            else:
+                await bot.send_message(LINKED_CHAT_ID, caption_plain, **send_kwargs)
+            sent_ok = True
         except Exception as e2:
             logger.error("Fallback отправки комментария: %s", e2)
-            await update.message.reply_text("❌ Не удалось опубликовать комментарий. Попробуй позже.")
-            return
 
-    await update.message.reply_text(
+    if not sent_ok:
+        await msg.reply_text("❌ Не удалось опубликовать комментарий. Попробуй позже.")
+        return
+
+    # Уведомляем автора исходной анонимки
+    await notify_anon_author(context, post_msg_id, uid)
+
+    # Определяем тип для красивого ответа
+    ctype = ("фото"      if msg.photo     else
+             "видео"     if msg.video     else
+             "GIF"       if msg.animation else
+             "аудио"     if msg.audio     else
+             "голосовое" if msg.voice     else
+             "документ"  if msg.document  else
+             "стикер"    if msg.sticker   else "текст")
+
+    await msg.reply_text(
         f"✅ *Комментарий опубликован!*\n\n"
+        f"Тип: {ctype}\n"
         f"Твой псевдоним: *{alias}*\n"
         f"Никто не знает что это ты 🔒\n\n"
         f"Хочешь написать ещё?",
@@ -965,6 +1069,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💬 *Анонимные комментарии*\n"
             "Под каждым постом в чате появляется кнопка.\n"
             "Нажми её — получишь рандомный псевдоним из эмодзи-животных.\n"
+            "Можно отправить текст, фото, видео, голосовое, GIF или стикер.\n"
             "Псевдоним уникален для каждого поста!\n\n"
             "🏆 *Топ анонимщиков*\n"
             "Еженедельный рейтинг. Каждая анонимка = +1 к счёту.\n\n"
@@ -990,7 +1095,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✉️ Режим анонимки.\n\nОтправь следующее сообщение 👇")
 
     elif data == "comment_again":
-        # Остаёмся в режиме комментариев — просто говорим пиши ещё
         post_msg_id = context.user_data.get("comment_post_id")
         alias       = get_animal_alias(uid, post_msg_id) if post_msg_id else "?"
         await query.edit_message_text(
@@ -1033,7 +1137,6 @@ async def show_message_logs_page(query, page):
     lines = [f"📩 Анонимки — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
     for i, e in enumerate(items, page*5+1):
         dt   = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
-        # FIX: username с любым регистром — просто берём как строку без Markdown-форматирования
         uname = e.get("username") or ""
         fname = (e.get("first_name") or "")
         lname = (e.get("last_name") or "")
@@ -1052,7 +1155,6 @@ async def show_message_logs_page(query, page):
             link = f"[🔗 открыть](https://t.me/c/{ch}/{mid})"
         else:
             link = f"🚫 {blk}" if blk else "—"
-        # Экранируем только спецсимволы в именах для Markdown
         safe_ustr = ustr.replace("_", "\\_").replace("*","\\*").replace("[","\\[")
         lines.append(
             f"{ico} *{i}.* {dt}\n"
@@ -1093,8 +1195,6 @@ async def show_start_logs_page(query, page):
         reply_markup=_nav(page, total, "start_page_", "start_clear"))
 
 async def show_comments_page(query, page):
-    """Показывает анонимные комментарии по постам."""
-    # Собираем все комментарии плоским списком
     all_comments = []
     for post_id, users in anon_comments.items():
         for uid_str, data in users.items():
