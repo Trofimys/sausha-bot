@@ -28,42 +28,26 @@ if sys.platform == "win32":
 
 BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
-LINKED_CHAT_ID = -1003718571364
 GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
 
-LOG_FILE         = "anon_logs.json"
-START_LOG_FILE   = "start_logs.json"
-MANUAL_IDS_FILE  = "manual_ids.json"
-TOP_FILE         = "top_data.json"
-COMMENTS_FILE    = "anon_comments.json"
+LOG_FILE        = "anon_logs.json"
+START_LOG_FILE  = "start_logs.json"
+MANUAL_IDS_FILE = "manual_ids.json"
+TOP_FILE        = "top_data.json"
 
-COOLDOWN_SECONDS  = 180
-COMMENT_COOLDOWN  = 60
-ANONYMOUS_MODE, AI_CHAT_MODE, COMMENT_MODE = 1, 2, 3
-TYPING_DELAY      = 0.015
-UPDATE_INTERVAL   = 5
-GROQ_SEMAPHORE    = asyncio.Semaphore(5)
+COOLDOWN_SECONDS = 180
+ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
+TYPING_DELAY     = 0.015
+UPDATE_INTERVAL  = 5
+GROQ_SEMAPHORE   = asyncio.Semaphore(5)
 
-ANIMAL_EMOJIS = [
-    "🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯",
-    "🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🦆","🦅",
-    "🦉","🦇","🐺","🐗","🐴","🦄","🐝","🐛","🦋","🐌",
-    "🐞","🐜","🦟","🦗","🕷","🦂","🐢","🐍","🦎","🦖",
-    "🦕","🐙","🦑","🦐","🦀","🐡","🐠","🐟","🐬","🐳",
-    "🦈","🐊","🐅","🐆","🦓","🦍","🦧","🦣","🐘","🦛",
-    "🦏","🐪","🐫","🦒","🦘","🦬","🐃","🐂","🐄","🐎",
-    "🐖","🐏","🐑","🦙","🐐","🦌","🐕","🐩","🦮","🐈",
-]
-
-user_last_time:     dict[int, datetime]   = {}
-user_comment_time:  dict[int, datetime]   = {}
-user_ai_context:    dict[int, list[dict]] = {}
-message_logs:  list[dict] = []
-start_logs:    list[dict] = []
-manual_ids:    list[int]  = []
-top_data:      dict       = {}
-anon_comments: dict       = {}
+user_last_time: dict[int, datetime]   = {}
+user_ai_context: dict[int, list[dict]] = {}
+message_logs: list[dict] = []
+start_logs:   list[dict] = []
+manual_ids:   list[int]  = []
+top_data:     dict       = {}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -155,14 +139,12 @@ def load_manual_ids() -> list[int]:
 def save_manual_ids(ids): _save_json(MANUAL_IDS_FILE, ids)
 
 def load_all_logs():
-    global message_logs, start_logs, manual_ids, top_data, anon_comments
-    message_logs   = _load_json(LOG_FILE)
-    start_logs     = _load_json(START_LOG_FILE)
-    manual_ids     = load_manual_ids()
-    raw            = _load_json(TOP_FILE)
-    top_data       = raw if isinstance(raw, dict) else {}
-    raw_c          = _load_json_dict(COMMENTS_FILE)
-    anon_comments  = raw_c if isinstance(raw_c, dict) else {}
+    global message_logs, start_logs, manual_ids, top_data
+    message_logs = _load_json(LOG_FILE)
+    start_logs   = _load_json(START_LOG_FILE)
+    manual_ids   = load_manual_ids()
+    raw          = _load_json(TOP_FILE)
+    top_data     = raw if isinstance(raw, dict) else {}
 
 def add_message_log(entry):
     message_logs.append(entry)
@@ -261,46 +243,6 @@ def build_top_text() -> str:
     lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
     return "\n".join(lines)
 
-# ── АНОНИМНЫЕ КОММЕНТАРИИ ─────────────────
-def get_animal_alias(user_id: int, post_msg_id: int) -> str:
-    import hashlib
-    seed_str = f"{user_id}:{post_msg_id}:alias_v1"
-    h = int(hashlib.sha256(seed_str.encode()).hexdigest(), 16)
-    n = len(ANIMAL_EMOJIS)
-    a = ANIMAL_EMOJIS[h % n]
-    b = ANIMAL_EMOJIS[(h // n) % n]
-    c = ANIMAL_EMOJIS[(h // n // n) % n]
-    return f"{a}{b}{c}"
-
-def save_comments(): _save_json(COMMENTS_FILE, anon_comments)
-
-def register_comment(post_msg_id: int, user_id: int, text: str) -> str:
-    key   = str(post_msg_id)
-    alias = get_animal_alias(user_id, post_msg_id)
-    if key not in anon_comments:
-        anon_comments[key] = {}
-    uid_str = str(user_id)
-    if uid_str not in anon_comments[key]:
-        anon_comments[key][uid_str] = {"alias": alias, "messages": []}
-    anon_comments[key][uid_str]["messages"].append({
-        "text": text,
-        "timestamp": datetime.now().isoformat(),
-    })
-    save_comments()
-    return alias
-
-def get_comments_for_post(post_msg_id: int) -> list[dict]:
-    key = str(post_msg_id)
-    if key not in anon_comments:
-        return []
-    result = []
-    for uid_str, data in anon_comments[key].items():
-        alias = data["alias"]
-        for msg in data["messages"]:
-            result.append({"alias": alias, "text": msg["text"], "timestamp": msg["timestamp"]})
-    result.sort(key=lambda x: x["timestamp"])
-    return result
-
 # ── GROQ API ──────────────────────────────
 async def _groq_request(payload, retries=2):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -377,141 +319,39 @@ async def typewriter_reply(update: Update, full_text: str):
 
 # ── ОТПРАВКА В КАНАЛ ──────────────────────
 async def send_to_channel(context, update, text) -> int | None:
-    """
-    БАГ-ФИКС: Убрали footer из caption при отправке медиа — он вызывал
-    ошибки из-за вложенных MarkdownV2 ссылок внутри caption у медиа.
-    Footer теперь отправляется отдельным сообщением только для медиа.
-    Для текстовых сообщений footer по-прежнему встроен.
-    """
     header  = "*📩 Анонимное сообщение*"
     safe    = escape_mdv2(text) if text else ""
     footer  = ">  [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
     caption = f"{header}\n\n{safe}" if safe else header
+    full    = f"{caption}\n\n{footer}"
 
     msg = update.message
     bot = context.bot
-
     try:
         s = None
         if msg.photo:
-            s = await bot.send_photo(
-                CHANNEL_ID, msg.photo[-1].file_id,
-                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.video:
-            s = await bot.send_video(
-                CHANNEL_ID, msg.video.file_id,
-                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_video(CHANNEL_ID, msg.video.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.animation:
-            s = await bot.send_animation(
-                CHANNEL_ID, msg.animation.file_id,
-                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_animation(CHANNEL_ID, msg.animation.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.audio:
-            s = await bot.send_audio(
-                CHANNEL_ID, msg.audio.file_id,
-                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_audio(CHANNEL_ID, msg.audio.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.voice:
-            s = await bot.send_voice(
-                CHANNEL_ID, msg.voice.file_id,
-                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_voice(CHANNEL_ID, msg.voice.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.document:
-            s = await bot.send_document(
-                CHANNEL_ID, msg.document.file_id,
-                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_document(CHANNEL_ID, msg.document.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.sticker:
-            # БАГ-ФИКС: стикеры не поддерживают caption — footer отдельным сообщением
             s = await bot.send_sticker(CHANNEL_ID, msg.sticker.file_id)
-            if s:
-                await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
+            await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
         elif msg.text:
-            s = await bot.send_message(
-                CHANNEL_ID, f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
-            )
+            s = await bot.send_message(CHANNEL_ID, full, parse_mode="MarkdownV2")
         else:
             return None
         return s.message_id if s else None
     except Exception as e:
-        logger.error("send_to_channel error: %s", e)
+        logger.error("send_to_channel: %s", e)
         return None
-
-
-# ── ПОСТ КНОПКИ АНОНИМНОГО КОММЕНТАРИЯ В ЧАТ ──
-async def post_comment_invite(context, channel_msg_id: int):
-    """
-    Отправляет кнопку анонимного комментария в связанный чат.
-    Стратегия попыток:
-      1. reply_to_message_id=channel_msg_id  — ответом на авто-форвард поста
-      2. message_thread_id=channel_msg_id    — в тред (если форвард уже стал тредом)
-      3. Без привязки                        — просто в чат
-    """
-    bot_link = f"https://t.me/Shkola6_anonchik_bot?start=comment_{channel_msg_id}"
-    text = "🤖 Чтобы оставить анонимный комментарий к этому посту, нажми на кнопку:"
-    kb   = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💬 Написать анонимно", url=bot_link)
-    ]])
-
-    # Попытка 1: ответ на авто-форвард поста в чате (самый правильный способ)
-    try:
-        await context.bot.send_message(
-            LINKED_CHAT_ID,
-            text,
-            reply_markup=kb,
-            reply_to_message_id=channel_msg_id,
-        )
-        logger.info("post_comment_invite OK reply: channel_msg_id=%s", channel_msg_id)
-        return
-    except Exception as e:
-        logger.warning("post_comment_invite reply failed (%s): %s", channel_msg_id, e)
-
-    # Попытка 2: через message_thread_id (треды включены)
-    try:
-        await context.bot.send_message(
-            LINKED_CHAT_ID,
-            text,
-            reply_markup=kb,
-            message_thread_id=channel_msg_id,
-        )
-        logger.info("post_comment_invite OK thread: channel_msg_id=%s", channel_msg_id)
-        return
-    except Exception as e:
-        logger.warning("post_comment_invite thread failed (%s): %s", channel_msg_id, e)
-
-    # Попытка 3: просто в чат без привязки
-    try:
-        await context.bot.send_message(LINKED_CHAT_ID, text, reply_markup=kb)
-        logger.info("post_comment_invite OK plain: channel_msg_id=%s", channel_msg_id)
-    except Exception as e:
-        logger.error("post_comment_invite totally failed (%s): %s", channel_msg_id, e)
-
-
-# ── УВЕДОМЛЕНИЕ АВТОРА АНОНИМКИ ──────────
-async def notify_anon_author(context, post_msg_id: int, commenter_uid: int):
-    original_author_id = None
-    for entry in reversed(message_logs):
-        if entry.get("channel_msg_id") == post_msg_id and not entry.get("blocked"):
-            original_author_id = entry.get("user_id")
-            break
-    if not original_author_id or original_author_id == commenter_uid:
-        return
-    ch = str(CHANNEL_ID).replace("-100", "")
-    post_link = f"https://t.me/c/{ch}/{post_msg_id}"
-    try:
-        await context.bot.send_message(
-            original_author_id,
-            "💬 *Кто-то ответил на твою анонимку!*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("👀 Посмотреть", url=post_link)
-            ]])
-        )
-    except Exception as e:
-        logger.error("notify_anon_author: %s", e)
-
 
 # ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
 async def notify_admin_silent(context, update, ctype, ctext):
@@ -536,14 +376,13 @@ async def notify_admin_silent(context, update, ctype, ctext):
     except Exception as e:
         logger.error("Админ-уведомление: %s", e)
 
-
 # ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✉️  Отправить анонимку",    callback_data="menu_anon")],
-        [InlineKeyboardButton("🏆  Топ анонимщиков",       callback_data="menu_top")],
-        [InlineKeyboardButton("🤖  Поболтать с ИИ",        callback_data="menu_ai")],
-        [InlineKeyboardButton("❓  Помощь",                 callback_data="menu_help")],
+        [InlineKeyboardButton("✉️  Отправить анонимку", callback_data="menu_anon")],
+        [InlineKeyboardButton("🏆  Топ анонимщиков",    callback_data="menu_top")],
+        [InlineKeyboardButton("🤖  Поболтать с ИИ",     callback_data="menu_ai")],
+        [InlineKeyboardButton("❓  Помощь",              callback_data="menu_help")],
     ])
 
 def top_keyboard(uid):
@@ -569,14 +408,13 @@ def ai_keyboard():
 
 def after_anon_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄  Отправить ещё",  callback_data="anon_again"),
-         InlineKeyboardButton("🏆  Мой топ",        callback_data="menu_top")],
-        [InlineKeyboardButton("🏠  Главное меню",   callback_data="menu_back")],
+        [InlineKeyboardButton("🔄  Отправить ещё", callback_data="anon_again"),
+         InlineKeyboardButton("🏆  Мой топ",       callback_data="menu_top")],
+        [InlineKeyboardButton("🏠  Главное меню",  callback_data="menu_back")],
     ])
 
 def back_keyboard(cb="menu_back"):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙  Назад", callback_data=cb)]])
-
 
 # ── ГЛАВНОЕ МЕНЮ ──────────────────────────
 MENU_TEXT = (
@@ -596,39 +434,15 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
     else:
         await update.message.reply_text(MENU_TEXT, reply_markup=kb)
 
-
 # ── КОМАНДЫ ───────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u    = update.effective_user
-    args = context.args
-
+    u = update.effective_user
     add_start_log(u.id, u.username, u.first_name, u.last_name)
     context.user_data.clear()
-
-    # Обработка deeplink для анонимных комментариев
-    if args and args[0].startswith("comment_"):
-        try:
-            post_msg_id = int(args[0].split("_", 1)[1])
-            context.user_data["state"]           = COMMENT_MODE
-            context.user_data["comment_post_id"] = post_msg_id
-            alias = get_animal_alias(u.id, post_msg_id)
-            await update.message.reply_text(
-                f"💬 *Анонимный комментарий*\n\n"
-                f"Твой псевдоним для этого поста: *{alias}*\n\n"
-                f"Отправь текст, фото, видео, голосовое, GIF или стикер 👇\n"
-                f"(появится в чате анонимно)",
-                parse_mode="Markdown",
-                reply_markup=back_keyboard("menu_back"),
-            )
-            return
-        except (ValueError, IndexError):
-            pass
-
     await update.message.reply_text(
         "🌟 *Добро пожаловать!*\n\n"
         "Этот бот позволяет тебе:\n\n"
         "✉️  Отправлять анонимки в канал\n"
-        "💬  Оставлять анонимные комментарии\n"
         "🏆  Участвовать в топе анонимщиков\n"
         "🤖  Общаться с ИИ\n\n"
         "Всё анонимно — никто не узнает 🔒",
@@ -642,31 +456,24 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
               or context.user_data.pop("awaiting_ids", None))
     await update.message.reply_text("✅ Отменено." if popped else "Нечего отменять.")
 
-
 # ── АДМИН-ПАНЕЛЬ ──────────────────────────
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩  Анонимки",         callback_data="admin_tab_messages"),
-         InlineKeyboardButton("💬  Комментарии",      callback_data="admin_tab_comments")],
-        [InlineKeyboardButton("👥  Пользователи",     callback_data="admin_tab_starts"),
-         InlineKeyboardButton("🏆  Топ",              callback_data="admin_view_top")],
-        [InlineKeyboardButton("📣  Рассылка",         callback_data="admin_broadcast"),
-         InlineKeyboardButton("➕  Добавить ID",      callback_data="admin_add_ids")],
-        [InlineKeyboardButton("📋  Список ID",        callback_data="admin_list_ids"),
-         InlineKeyboardButton("📤  Экспорт CSV",      callback_data="admin_export")],
-        [InlineKeyboardButton("🧹  Удалить >7д",      callback_data="admin_clean_old")],
+        [InlineKeyboardButton("📩  Анонимки",     callback_data="admin_tab_messages"),
+         InlineKeyboardButton("👥  Пользователи", callback_data="admin_tab_starts")],
+        [InlineKeyboardButton("🏆  Топ",          callback_data="admin_view_top"),
+         InlineKeyboardButton("📣  Рассылка",     callback_data="admin_broadcast")],
+        [InlineKeyboardButton("➕  Добавить ID",  callback_data="admin_add_ids"),
+         InlineKeyboardButton("📋  Список ID",    callback_data="admin_list_ids")],
+        [InlineKeyboardButton("📤  Экспорт CSV",  callback_data="admin_export"),
+         InlineKeyboardButton("🧹  Удалить >7д",  callback_data="admin_clean_old")],
     ])
 
 def admin_text():
-    total_comments = sum(
-        sum(len(u["messages"]) for u in post.values())
-        for post in anon_comments.values()
-    )
     return (
         "👑 АДМИН-ПАНЕЛЬ\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"📩  Всего анонимок:      {len(message_logs)}\n"
-        f"💬  Всего комментариев:  {total_comments}\n"
         f"👥  Всего пользователей: {len(start_logs)}\n"
         f"🏆  В топе сейчас:       {len(get_top_entries())}\n"
         f"📅  Текущая неделя:      {current_week_key()}\n"
@@ -707,8 +514,8 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_view_top":
         entries = get_top_entries()
-        M       = ["🥇","🥈","🥉"]
-        lines   = ["🏆 *Топ анонимщиков*\n"]
+        M = ["🥇","🥈","🥉"]
+        lines = ["🏆 *Топ анонимщиков*\n"]
         if not entries:
             lines.append("Пока пусто 😶")
         else:
@@ -725,9 +532,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_tab_starts":
         await show_start_logs_page(query, 0)
 
-    elif data == "admin_tab_comments":
-        await show_comments_page(query, 0)
-
     elif data == "admin_export":
         await export_logs_csv(query)
 
@@ -743,9 +547,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("start_page_"):
         await show_start_logs_page(query, int(data.rsplit("_",1)[-1]))
 
-    elif data.startswith("comm_page_"):
-        await show_comments_page(query, int(data.rsplit("_",1)[-1]))
-
     elif data == "msg_clear":
         message_logs.clear()
         _save_json(LOG_FILE, message_logs)
@@ -756,33 +557,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_json(START_LOG_FILE, start_logs)
         await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=admin_keyboard())
 
-    elif data == "comm_clear":
-        anon_comments.clear()
-        save_comments()
-        await query.edit_message_text("🧹 Комментарии очищены.", reply_markup=admin_keyboard())
-
     else:
         await query.answer("Неизвестная команда.", show_alert=True)
 
-
-# ── ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ ─────────────
+# ── ОБРАБОТЧИК СООБЩЕНИЙ ──────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # БАГ-ФИКС: игнорируем сообщения из связанного чата и канала
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
-        return
-
-    # БАГ-ФИКС: проверяем наличие update.message (edited_message и др. дают None)
-    if not update.message:
-        return
-
-    # БАГ-ФИКС: игнорируем сообщения без пользователя (форварды от каналов и т.д.)
-    if not update.effective_user:
+    if not update.message or not update.effective_user:
         return
 
     uid = update.effective_user.id
 
-    # --- ожидаем ник для топа ---
+    # --- ник для топа ---
     if context.user_data.get("awaiting_top_nick"):
         nick = (update.message.text or "").strip()
         if not nick or len(nick) > 32:
@@ -793,7 +578,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = top_data.get(str(uid), {}).get("count", 0)
         await update.message.reply_text(
             f"✅ Ты в топе под ником *{nick}*!\n\n"
-            f"📊 Твои анонимки за эту неделю уже засчитаны: *{count}*\n\n"
+            f"📊 Твои анонимки за эту неделю: *{count}*\n\n"
             f"{build_top_text()}",
             parse_mode="Markdown",
             reply_markup=top_keyboard(uid))
@@ -847,11 +632,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_anonymous(update, context)
     elif state == AI_CHAT_MODE:
         await handle_ai_chat(update, context)
-    elif state == COMMENT_MODE:
-        await handle_comment(update, context)
     else:
         await main_menu(update, context)
-
 
 # ── АНОНИМКА ──────────────────────────────
 async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -866,7 +648,6 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
         return
 
-    # Проверяем контент только если есть текст
     if text.strip():
         ok, reason = await is_content_acceptable(text)
         if not ok:
@@ -908,140 +689,12 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     increment_top(uid)
     await notify_admin_silent(context, update, ctype, text)
 
-    await post_comment_invite(context, mid)
-
     await update.message.reply_text(
         "✅ *Анонимка отправлена!*\n\n"
         "Твоё сообщение опубликовано в канале 🎉\n"
         "Никто не знает что это ты 🔒",
         parse_mode="Markdown",
         reply_markup=after_anon_keyboard())
-
-
-# ── АНОНИМНЫЙ КОММЕНТАРИЙ ─────────────────
-async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid         = update.effective_user.id
-    post_msg_id = context.user_data.get("comment_post_id")
-    msg         = update.message
-    text        = (msg.text or msg.caption or "").strip()
-    now         = datetime.now()
-
-    if not post_msg_id:
-        await msg.reply_text("❌ Пост не найден. Вернись через ссылку из чата.")
-        context.user_data.pop("state", None)
-        return
-
-    has_media = bool(msg.photo or msg.video or msg.animation or
-                     msg.audio or msg.voice or msg.document or msg.sticker)
-    if not text and not has_media:
-        await msg.reply_text("⚠️ Отправь текст, фото, видео, голосовое, GIF или стикер.")
-        return
-
-    last = user_comment_time.get(uid)
-    if last and (now - last).total_seconds() < COMMENT_COOLDOWN:
-        rem = int(COMMENT_COOLDOWN - (now - last).total_seconds())
-        await msg.reply_text(f"⏳ Подожди ещё {rem} сек. перед следующим комментарием.")
-        return
-
-    # Проверяем контент только если есть текст
-    if text:
-        ok, reason = await is_content_acceptable(text)
-        if not ok:
-            await msg.reply_text(
-                f"🚫 *Комментарий не принят*\n\nПричина: {reason}",
-                parse_mode="Markdown")
-            return
-
-    alias = register_comment(post_msg_id, uid, text)
-    user_comment_time[uid] = now
-
-    alias_escaped = escape_mdv2(alias)
-    text_escaped  = escape_mdv2(text) if text else ""
-    if text_escaped:
-        caption_mdv2  = f">{alias_escaped}\n{text_escaped}"
-        caption_plain = f"{alias}\n{text}"
-    else:
-        caption_mdv2  = f">{alias_escaped}"
-        caption_plain = alias
-
-    bot      = context.bot
-    sent_ok  = False
-
-    # БАГ-ФИКС: пробуем с тредом, если не получилось — без треда
-    async def _send_comment_to_chat(thread_id=None):
-        """Отправляет комментарий в связанный чат. thread_id=None → без треда."""
-        nonlocal sent_ok
-        kw = {}
-        if thread_id is not None:
-            kw["message_thread_id"] = thread_id
-
-        try:
-            if msg.photo:
-                await bot.send_photo(LINKED_CHAT_ID, msg.photo[-1].file_id,
-                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
-            elif msg.video:
-                await bot.send_video(LINKED_CHAT_ID, msg.video.file_id,
-                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
-            elif msg.animation:
-                await bot.send_animation(LINKED_CHAT_ID, msg.animation.file_id,
-                                         caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
-            elif msg.audio:
-                await bot.send_audio(LINKED_CHAT_ID, msg.audio.file_id,
-                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
-            elif msg.voice:
-                await bot.send_voice(LINKED_CHAT_ID, msg.voice.file_id,
-                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
-            elif msg.document:
-                await bot.send_document(LINKED_CHAT_ID, msg.document.file_id,
-                                        caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
-            elif msg.sticker:
-                await bot.send_sticker(LINKED_CHAT_ID, msg.sticker.file_id, **kw)
-                await bot.send_message(LINKED_CHAT_ID, caption_plain, **kw)
-            else:
-                await bot.send_message(LINKED_CHAT_ID, caption_mdv2,
-                                       parse_mode="MarkdownV2", **kw)
-            sent_ok = True
-        except Exception as e:
-            raise e
-
-    # Попытка 1: в тред поста
-    try:
-        await _send_comment_to_chat(thread_id=post_msg_id)
-    except Exception as e:
-        logger.warning("Комментарий в тред не удался (%s): %s — пробую без треда", post_msg_id, e)
-        # Попытка 2: без треда
-        try:
-            await _send_comment_to_chat(thread_id=None)
-        except Exception as e2:
-            logger.error("Комментарий без треда тоже не удался: %s", e2)
-
-    if not sent_ok:
-        await msg.reply_text("❌ Не удалось опубликовать комментарий. Попробуй позже.")
-        return
-
-    # Уведомляем автора исходной анонимки
-    await notify_anon_author(context, post_msg_id, uid)
-
-    ctype = ("фото"      if msg.photo     else
-             "видео"     if msg.video     else
-             "GIF"       if msg.animation else
-             "аудио"     if msg.audio     else
-             "голосовое" if msg.voice     else
-             "документ"  if msg.document  else
-             "стикер"    if msg.sticker   else "текст")
-
-    await msg.reply_text(
-        f"✅ *Комментарий опубликован!*\n\n"
-        f"Тип: {ctype}\n"
-        f"Твой псевдоним: *{alias}*\n"
-        f"Никто не знает что это ты 🔒\n\n"
-        f"Хочешь написать ещё?",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💬 Ещё комментарий", callback_data="comment_again")],
-            [InlineKeyboardButton("🏠 Главное меню",    callback_data="menu_back")],
-        ]))
-
 
 # ── ИИ-ЧАТ ───────────────────────────────
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1053,24 +706,16 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     res = await call_groq_with_context(update.effective_user.id, inp)
     await typewriter_reply(update, res or "⚠️ ИИ временно недоступен.")
 
-
-# ── КНОПКИ (основной обработчик) ──────────
+# ── КНОПКИ ────────────────────────────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query   = update.callback_query
-    # БАГ-ФИКС: answer() в самом начале — предотвращает "часики" на кнопке
+    query = update.callback_query
     await query.answer()
-
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
-        return
-
     data = query.data
     uid  = update.effective_user.id
 
-    # Делегируем админские коллбэки
     if (data.startswith("admin_") or data.startswith("msg_page_")
-            or data.startswith("start_page_") or data.startswith("comm_page_")
-            or data in ("msg_clear","start_clear","comm_clear")):
+            or data.startswith("start_page_")
+            or data in ("msg_clear","start_clear")):
         await admin_callback(update, context)
         return
 
@@ -1124,11 +769,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✉️ *Анонимка*\n"
             "Отправь любое сообщение — оно выйдет в канале без твоего имени.\n"
             "Поддерживаются: текст, фото, видео, голос, GIF, стикер.\n\n"
-            "💬 *Анонимные комментарии*\n"
-            "Под каждым постом в чате появляется кнопка.\n"
-            "Нажми её — получишь рандомный псевдоним из эмодзи-животных.\n"
-            "Можно отправить текст, фото, видео, голосовое, GIF или стикер.\n"
-            "Псевдоним уникален для каждого поста!\n\n"
             "🏆 *Топ анонимщиков*\n"
             "Еженедельный рейтинг. Каждая анонимка = +1 к счёту.\n\n"
             "🤖 *ИИ-чат*\n"
@@ -1139,7 +779,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "menu_back":
         context.user_data.pop("state", None)
-        context.user_data.pop("comment_post_id", None)
         await main_menu(update, context, edit=True)
 
     elif data == "ai_reset":
@@ -1152,19 +791,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = ANONYMOUS_MODE
         await query.edit_message_text("✉️ Режим анонимки.\n\nОтправь следующее сообщение 👇")
 
-    elif data == "comment_again":
-        post_msg_id = context.user_data.get("comment_post_id")
-        alias       = get_animal_alias(uid, post_msg_id) if post_msg_id else "?"
-        await query.edit_message_text(
-            f"💬 *Режим комментариев*\n\n"
-            f"Твой псевдоним: *{alias}*\n\n"
-            f"Напиши следующий комментарий 👇",
-            parse_mode="Markdown",
-            reply_markup=back_keyboard("menu_back"))
-
     else:
         await query.answer("Неизвестная команда. Используй /start.", show_alert=True)
-
 
 # ── ЛОГИ / ПАГИНАЦИЯ ─────────────────────
 def _paginate(items, page, per=5):
@@ -1195,26 +823,21 @@ async def show_message_logs_page(query, page):
     items, total = _paginate(message_logs, page)
     lines = [f"📩 Анонимки — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
     for i, e in enumerate(items, page*5+1):
-        dt   = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+        dt    = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
         uname = e.get("username") or ""
-        fname = (e.get("first_name") or "")
-        lname = (e.get("last_name") or "")
-        if uname:
-            ustr = f"@{uname}"
-        elif fname or lname:
-            ustr = f"{fname} {lname}".strip()
-        else:
-            ustr = "—"
-        snip = (e.get("text") or "")[:60] or "—"
-        blk  = e.get("blocked")
-        ico  = "🚫" if blk else "✅"
-        mid  = e.get("channel_msg_id")
+        fname = e.get("first_name") or ""
+        lname = e.get("last_name") or ""
+        ustr  = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        snip  = (e.get("text") or "")[:60] or "—"
+        blk   = e.get("blocked")
+        ico   = "🚫" if blk else "✅"
+        mid   = e.get("channel_msg_id")
         if mid and not blk:
             ch   = str(CHANNEL_ID).replace("-100","")
             link = f"[🔗 открыть](https://t.me/c/{ch}/{mid})"
         else:
             link = f"🚫 {blk}" if blk else "—"
-        safe_ustr = ustr.replace("_", "\\_").replace("*","\\*").replace("[","\\[")
+        safe_ustr = ustr.replace("_","\\_").replace("*","\\*").replace("[","\\[")
         lines.append(
             f"{ico} *{i}.* {dt}\n"
             f"👤 `{e['user_id']}` {safe_ustr}\n"
@@ -1238,54 +861,15 @@ async def show_start_logs_page(query, page):
     for i, e in enumerate(items, page*5+1):
         dt    = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
         uname = e.get("username") or ""
-        fname = (e.get("first_name") or "")
-        lname = (e.get("last_name") or "")
-        if uname:
-            ustr = f"@{uname}"
-        elif fname or lname:
-            ustr = f"{fname} {lname}".strip()
-        else:
-            ustr = "—"
-        safe_ustr = ustr.replace("_", "\\_").replace("*","\\*").replace("[","\\[")
+        fname = e.get("first_name") or ""
+        lname = e.get("last_name") or ""
+        ustr  = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        safe_ustr = ustr.replace("_","\\_").replace("*","\\*").replace("[","\\[")
         lines.append(f"*{i}.* {dt}\n👤 `{e['user_id']}` {safe_ustr}")
     await query.edit_message_text(
         "\n\n".join(lines),
         parse_mode="Markdown",
         reply_markup=_nav(page, total, "start_page_", "start_clear"))
-
-async def show_comments_page(query, page):
-    all_comments = []
-    for post_id, users in anon_comments.items():
-        for uid_str, data in users.items():
-            alias = data["alias"]
-            for msg in data["messages"]:
-                all_comments.append({
-                    "post_id": post_id,
-                    "alias": alias,
-                    "text": msg["text"],
-                    "timestamp": msg["timestamp"],
-                })
-    all_comments.sort(key=lambda x: x["timestamp"], reverse=True)
-
-    if not all_comments:
-        await query.edit_message_text(
-            "📭 Нет анонимных комментариев.",
-            reply_markup=_nav(0, 1, "comm_page_", "comm_clear"))
-        return
-
-    items, total = _paginate(all_comments, page)
-    lines = [f"💬 Комментарии — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
-    ch = str(CHANNEL_ID).replace("-100","")
-    for i, e in enumerate(items, page*5+1):
-        dt   = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
-        snip = e["text"][:80]
-        link = f"[пост](https://t.me/c/{ch}/{e['post_id']})"
-        lines.append(f"*{i}.* {dt}\n{e['alias']} → {link}\n💬 {snip}")
-    await query.edit_message_text(
-        "\n\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=_nav(page, total, "comm_page_", "comm_clear"),
-        disable_web_page_preview=True)
 
 async def export_logs_csv(query):
     buf = io.StringIO()
@@ -1309,21 +893,6 @@ async def clean_old_logs(query):
         f"🧹 Удалено {before - len(message_logs)} записей старше 7 дней.",
         reply_markup=admin_keyboard())
 
-
-# ── ОБРАБОТЧИК ПОСТОВ ИЗ КАНАЛА ──────────
-# БАГ-ФИКС: этот хендлер срабатывает на ВСЕ посты канала,
-# в т.ч. опубликованные вручную — кнопка комментария появится под каждым.
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    post = update.channel_post
-    if not post:
-        return
-    if post.chat.id != CHANNEL_ID:
-        return
-    channel_msg_id = post.message_id
-    logger.info("Новый пост в канале: msg_id=%s", channel_msg_id)
-    await post_comment_invite(context, channel_msg_id)
-
-
 # ── ТОЧКА ВХОДА ───────────────────────────
 def main():
     load_all_logs()
@@ -1333,22 +902,13 @@ def main():
     app.add_handler(CommandHandler("admin",  cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(button_callback))
-
-    # БАГ-ФИКС: хендлер постов канала должен идти ДО общего handle_message
-    # чтобы посты из канала не попадали в handle_message
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-
-    # Обрабатываем только личные сообщения (не из канала и не из группы)
-    # БАГ-ФИКС: добавлен фильтр ~filters.ChatType.CHANNEL & ~filters.UpdateType.CHANNEL_POST
     app.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND & ~filters.ChatType.CHANNEL,
         handle_message
     ))
 
     logger.info("✅ Бот запущен!")
-    # allowed_updates=Update.ALL_TYPES нужен чтобы получать channel_post апдейты
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
