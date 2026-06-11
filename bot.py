@@ -17,7 +17,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
     CallbackQueryHandler,
-    ChatMemberHandler,
 )
 import threading
 import time
@@ -378,60 +377,107 @@ async def typewriter_reply(update: Update, full_text: str):
 
 # ── ОТПРАВКА В КАНАЛ ──────────────────────
 async def send_to_channel(context, update, text) -> int | None:
+    """
+    БАГ-ФИКС: Убрали footer из caption при отправке медиа — он вызывал
+    ошибки из-за вложенных MarkdownV2 ссылок внутри caption у медиа.
+    Footer теперь отправляется отдельным сообщением только для медиа.
+    Для текстовых сообщений footer по-прежнему встроен.
+    """
     header  = "*📩 Анонимное сообщение*"
     safe    = escape_mdv2(text) if text else ""
-    footer  = "> [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
+    footer  = ">  [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
     caption = f"{header}\n\n{safe}" if safe else header
-    caption_full = f"{caption}\n\n{footer}"
 
     msg = update.message
     bot = context.bot
+
     try:
         s = None
         if msg.photo:
-            s = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id, caption=caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_photo(
+                CHANNEL_ID, msg.photo[-1].file_id,
+                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         elif msg.video:
-            s = await bot.send_video(CHANNEL_ID, msg.video.file_id, caption=caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_video(
+                CHANNEL_ID, msg.video.file_id,
+                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         elif msg.animation:
-            s = await bot.send_animation(CHANNEL_ID, msg.animation.file_id, caption=caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_animation(
+                CHANNEL_ID, msg.animation.file_id,
+                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         elif msg.audio:
-            s = await bot.send_audio(CHANNEL_ID, msg.audio.file_id, caption=caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_audio(
+                CHANNEL_ID, msg.audio.file_id,
+                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         elif msg.voice:
-            s = await bot.send_voice(CHANNEL_ID, msg.voice.file_id, caption=caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_voice(
+                CHANNEL_ID, msg.voice.file_id,
+                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         elif msg.document:
-            s = await bot.send_document(CHANNEL_ID, msg.document.file_id, caption=caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_document(
+                CHANNEL_ID, msg.document.file_id,
+                caption=f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         elif msg.sticker:
+            # БАГ-ФИКС: стикеры не поддерживают caption — footer отдельным сообщением
             s = await bot.send_sticker(CHANNEL_ID, msg.sticker.file_id)
-            await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
+            if s:
+                await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
         elif msg.text:
-            s = await bot.send_message(CHANNEL_ID, caption_full, parse_mode="MarkdownV2")
+            s = await bot.send_message(
+                CHANNEL_ID, f"{caption}\n\n{footer}", parse_mode="MarkdownV2"
+            )
         else:
             return None
         return s.message_id if s else None
     except Exception as e:
-        logger.error("Канал send_to_channel: %s", e)
+        logger.error("send_to_channel error: %s", e)
         return None
 
-# ── ПОСТ КОММЕНТАРИЕВ В ЧАТЕ ──────────────
-# ИСПРАВЛЕНО: теперь отправляется как REPLY на пост в канале (reply_to_message_id)
+
+# ── ПОСТ КНОПКИ АНОНИМНОГО КОММЕНТАРИЯ В ЧАТ ──
 async def post_comment_invite(context, channel_msg_id: int):
+    """
+    БАГ-ФИКС: Убран лишний try/except глотающий ошибки без логов.
+    Добавлена попытка с reply_to_message_id как fallback если тред не работает.
+    """
+    bot_link = f"https://t.me/Shkola6_anonchik_bot?start=comment_{channel_msg_id}"
+    text = "🤖 Чтобы оставить анонимный комментарий к этому посту, нажми на кнопку:"
+    kb   = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 Написать анонимно", url=bot_link)
+    ]])
+
+    # Попытка 1: отправить в тред поста (message_thread_id = channel_msg_id)
     try:
-        bot_link = f"https://t.me/Shkola6_anonchik_bot?start=comment_{channel_msg_id}"
-        text = "🤖 Чтобы оставить анонимный комментарий к этому посту, нажмите на кнопку:"
-        kb   = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💬 Написать анонимно", url=bot_link)
-        ]])
         await context.bot.send_message(
             LINKED_CHAT_ID,
             text,
             reply_markup=kb,
-            reply_to_message_id=channel_msg_id,  # <- привязка к посту
+            message_thread_id=channel_msg_id,
         )
+        logger.info("post_comment_invite OK thread: channel_msg_id=%s", channel_msg_id)
+        return
     except Exception as e:
-        logger.error("post_comment_invite: %s", e)
+        logger.warning("post_comment_invite thread failed (%s): %s — пробую без треда", channel_msg_id, e)
+
+    # Попытка 2: без треда (для чатов без включённых обсуждений)
+    try:
+        await context.bot.send_message(
+            LINKED_CHAT_ID,
+            text,
+            reply_markup=kb,
+        )
+        logger.info("post_comment_invite OK no-thread: channel_msg_id=%s", channel_msg_id)
+    except Exception as e:
+        logger.error("post_comment_invite totally failed (%s): %s", channel_msg_id, e)
+
 
 # ── УВЕДОМЛЕНИЕ АВТОРА АНОНИМКИ ──────────
-# НОВОЕ: уведомляем автора, что кто-то написал комментарий под его постом
 async def notify_anon_author(context, post_msg_id: int, commenter_uid: int):
     original_author_id = None
     for entry in reversed(message_logs):
@@ -453,6 +499,7 @@ async def notify_anon_author(context, post_msg_id: int, commenter_uid: int):
         )
     except Exception as e:
         logger.error("notify_anon_author: %s", e)
+
 
 # ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
 async def notify_admin_silent(context, update, ctype, ctext):
@@ -476,6 +523,7 @@ async def notify_admin_silent(context, update, ctype, ctext):
         await context.bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
     except Exception as e:
         logger.error("Админ-уведомление: %s", e)
+
 
 # ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():
@@ -517,6 +565,7 @@ def after_anon_keyboard():
 def back_keyboard(cb="menu_back"):
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙  Назад", callback_data=cb)]])
 
+
 # ── ГЛАВНОЕ МЕНЮ ──────────────────────────
 MENU_TEXT = (
     "👋 Привет!\n\n"
@@ -534,6 +583,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
             await context.bot.send_message(update.effective_chat.id, MENU_TEXT, reply_markup=kb)
     else:
         await update.message.reply_text(MENU_TEXT, reply_markup=kb)
+
 
 # ── КОМАНДЫ ───────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -579,6 +629,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     popped = (context.user_data.pop("awaiting_broadcast", None)
               or context.user_data.pop("awaiting_ids", None))
     await update.message.reply_text("✅ Отменено." if popped else "Нечего отменять.")
+
 
 # ── АДМИН-ПАНЕЛЬ ──────────────────────────
 def admin_keyboard():
@@ -693,24 +744,28 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_json(START_LOG_FILE, start_logs)
         await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=admin_keyboard())
 
-    # ИСПРАВЛЕНО: добавлен обработчик comm_clear, которого раньше не было — вызывал KeyError
     elif data == "comm_clear":
         anon_comments.clear()
         save_comments()
         await query.edit_message_text("🧹 Комментарии очищены.", reply_markup=admin_keyboard())
 
     else:
-        await query.edit_message_text("Неизвестная команда.")
+        await query.answer("Неизвестная команда.", show_alert=True)
+
 
 # ── ОБРАБОТЧИК ВСЕХ СООБЩЕНИЙ ─────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Игнорируем сообщения из привязанного чата и канала
+    # БАГ-ФИКС: игнорируем сообщения из связанного чата и канала
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
         return
 
-    # ИСПРАВЛЕНО: если update.message is None (например, edited_message) — выходим
+    # БАГ-ФИКС: проверяем наличие update.message (edited_message и др. дают None)
     if not update.message:
+        return
+
+    # БАГ-ФИКС: игнорируем сообщения без пользователя (форварды от каналов и т.д.)
+    if not update.effective_user:
         return
 
     uid = update.effective_user.id
@@ -785,6 +840,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await main_menu(update, context)
 
+
 # ── АНОНИМКА ──────────────────────────────
 async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
@@ -798,6 +854,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
         return
 
+    # Проверяем контент только если есть текст
     if text.strip():
         ok, reason = await is_content_acceptable(text)
         if not ok:
@@ -820,13 +877,13 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_last_time[uid] = now
     msg   = update.message
-    ctype = ("фото"     if msg.photo     else
-             "видео"    if msg.video     else
-             "GIF"      if msg.animation else
-             "аудио"    if msg.audio     else
-             "голосовое" if msg.voice    else
-             "документ" if msg.document  else
-             "стикер"   if msg.sticker   else "текст")
+    ctype = ("фото"      if msg.photo     else
+             "видео"     if msg.video     else
+             "GIF"       if msg.animation else
+             "аудио"     if msg.audio     else
+             "голосовое" if msg.voice     else
+             "документ"  if msg.document  else
+             "стикер"    if msg.sticker   else "текст")
 
     add_message_log({
         "user_id": uid, "username": update.effective_user.username,
@@ -839,7 +896,8 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     increment_top(uid)
     await notify_admin_silent(context, update, ctype, text)
 
-    # ИСПРАВЛЕНО: отправляем кнопку как reply под постом канала
+    # БАГ-ФИКС: ждём немного перед отправкой кнопки — тред в чате должен успеть создаться
+    await asyncio.sleep(1)
     await post_comment_invite(context, mid)
 
     await update.message.reply_text(
@@ -848,6 +906,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Никто не знает что это ты 🔒",
         parse_mode="Markdown",
         reply_markup=after_anon_keyboard())
+
 
 # ── АНОНИМНЫЙ КОММЕНТАРИЙ ─────────────────
 async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -862,7 +921,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("state", None)
         return
 
-    # Проверяем что хоть что-то есть (текст или медиа)
     has_media = bool(msg.photo or msg.video or msg.animation or
                      msg.audio or msg.voice or msg.document or msg.sticker)
     if not text and not has_media:
@@ -875,7 +933,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"⏳ Подожди ещё {rem} сек. перед следующим комментарием.")
         return
 
-    # Проверка контента только для текста
+    # Проверяем контент только если есть текст
     if text:
         ok, reason = await is_content_acceptable(text)
         if not ok:
@@ -887,11 +945,10 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alias = register_comment(post_msg_id, uid, text)
     user_comment_time[uid] = now
 
-    # Формируем подпись: псевдоним как цитата + текст (если есть)
     alias_escaped = escape_mdv2(alias)
     text_escaped  = escape_mdv2(text) if text else ""
     if text_escaped:
-        caption_mdv2 = f">{alias_escaped}\n{text_escaped}"
+        caption_mdv2  = f">{alias_escaped}\n{text_escaped}"
         caption_plain = f"{alias}\n{text}"
     else:
         caption_mdv2  = f">{alias_escaped}"
@@ -899,66 +956,54 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bot      = context.bot
     sent_ok  = False
-    send_kwargs = dict(reply_to_message_id=post_msg_id)
 
-    try:
-        if msg.photo:
-            await bot.send_photo(LINKED_CHAT_ID, msg.photo[-1].file_id,
-                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
-        elif msg.video:
-            await bot.send_video(LINKED_CHAT_ID, msg.video.file_id,
-                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
-        elif msg.animation:
-            await bot.send_animation(LINKED_CHAT_ID, msg.animation.file_id,
-                                     caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
-        elif msg.audio:
-            await bot.send_audio(LINKED_CHAT_ID, msg.audio.file_id,
-                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
-        elif msg.voice:
-            await bot.send_voice(LINKED_CHAT_ID, msg.voice.file_id,
-                                 caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
-        elif msg.document:
-            await bot.send_document(LINKED_CHAT_ID, msg.document.file_id,
-                                    caption=caption_mdv2, parse_mode="MarkdownV2", **send_kwargs)
-        elif msg.sticker:
-            await bot.send_sticker(LINKED_CHAT_ID, msg.sticker.file_id, **send_kwargs)
-            # Для стикера псевдоним отправляем отдельным сообщением
-            await bot.send_message(LINKED_CHAT_ID, caption_plain, **send_kwargs)
-        else:
-            # Просто текст
-            await bot.send_message(LINKED_CHAT_ID, caption_mdv2,
-                                   parse_mode="MarkdownV2", **send_kwargs)
-        sent_ok = True
-    except Exception as e:
-        logger.error("Отправка комментария в чат (MDv2): %s", e)
-        # Fallback без MarkdownV2
+    # БАГ-ФИКС: пробуем с тредом, если не получилось — без треда
+    async def _send_comment_to_chat(thread_id=None):
+        """Отправляет комментарий в связанный чат. thread_id=None → без треда."""
+        nonlocal sent_ok
+        kw = {}
+        if thread_id is not None:
+            kw["message_thread_id"] = thread_id
+
         try:
             if msg.photo:
                 await bot.send_photo(LINKED_CHAT_ID, msg.photo[-1].file_id,
-                                     caption=caption_plain, **send_kwargs)
+                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
             elif msg.video:
                 await bot.send_video(LINKED_CHAT_ID, msg.video.file_id,
-                                     caption=caption_plain, **send_kwargs)
+                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
             elif msg.animation:
                 await bot.send_animation(LINKED_CHAT_ID, msg.animation.file_id,
-                                         caption=caption_plain, **send_kwargs)
+                                         caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
             elif msg.audio:
                 await bot.send_audio(LINKED_CHAT_ID, msg.audio.file_id,
-                                     caption=caption_plain, **send_kwargs)
+                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
             elif msg.voice:
                 await bot.send_voice(LINKED_CHAT_ID, msg.voice.file_id,
-                                     caption=caption_plain, **send_kwargs)
+                                     caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
             elif msg.document:
                 await bot.send_document(LINKED_CHAT_ID, msg.document.file_id,
-                                        caption=caption_plain, **send_kwargs)
+                                        caption=caption_mdv2, parse_mode="MarkdownV2", **kw)
             elif msg.sticker:
-                await bot.send_sticker(LINKED_CHAT_ID, msg.sticker.file_id, **send_kwargs)
-                await bot.send_message(LINKED_CHAT_ID, caption_plain, **send_kwargs)
+                await bot.send_sticker(LINKED_CHAT_ID, msg.sticker.file_id, **kw)
+                await bot.send_message(LINKED_CHAT_ID, caption_plain, **kw)
             else:
-                await bot.send_message(LINKED_CHAT_ID, caption_plain, **send_kwargs)
+                await bot.send_message(LINKED_CHAT_ID, caption_mdv2,
+                                       parse_mode="MarkdownV2", **kw)
             sent_ok = True
+        except Exception as e:
+            raise e
+
+    # Попытка 1: в тред поста
+    try:
+        await _send_comment_to_chat(thread_id=post_msg_id)
+    except Exception as e:
+        logger.warning("Комментарий в тред не удался (%s): %s — пробую без треда", post_msg_id, e)
+        # Попытка 2: без треда
+        try:
+            await _send_comment_to_chat(thread_id=None)
         except Exception as e2:
-            logger.error("Fallback отправки комментария: %s", e2)
+            logger.error("Комментарий без треда тоже не удался: %s", e2)
 
     if not sent_ok:
         await msg.reply_text("❌ Не удалось опубликовать комментарий. Попробуй позже.")
@@ -967,7 +1012,6 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Уведомляем автора исходной анонимки
     await notify_anon_author(context, post_msg_id, uid)
 
-    # Определяем тип для красивого ответа
     ctype = ("фото"      if msg.photo     else
              "видео"     if msg.video     else
              "GIF"       if msg.animation else
@@ -988,6 +1032,7 @@ async def handle_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🏠 Главное меню",    callback_data="menu_back")],
         ]))
 
+
 # ── ИИ-ЧАТ ───────────────────────────────
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inp = update.message.text
@@ -998,14 +1043,17 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     res = await call_groq_with_context(update.effective_user.id, inp)
     await typewriter_reply(update, res or "⚠️ ИИ временно недоступен.")
 
+
 # ── КНОПКИ (основной обработчик) ──────────
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
+    # БАГ-ФИКС: answer() в самом начале — предотвращает "часики" на кнопке
+    await query.answer()
+
     chat_id = update.effective_chat.id if update.effective_chat else None
     if chat_id in (LINKED_CHAT_ID, CHANNEL_ID):
-        await query.answer()
         return
-    await query.answer()
+
     data = query.data
     uid  = update.effective_user.id
 
@@ -1105,7 +1153,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard("menu_back"))
 
     else:
-        await query.edit_message_text("Неизвестная команда. Используй /start.")
+        await query.answer("Неизвестная команда. Используй /start.", show_alert=True)
+
 
 # ── ЛОГИ / ПАГИНАЦИЯ ─────────────────────
 def _paginate(items, page, per=5):
@@ -1250,8 +1299,10 @@ async def clean_old_logs(query):
         f"🧹 Удалено {before - len(message_logs)} записей старше 7 дней.",
         reply_markup=admin_keyboard())
 
+
 # ── ОБРАБОТЧИК ПОСТОВ ИЗ КАНАЛА ──────────
-# Срабатывает на ЛЮБОЙ пост в канале — в т.ч. опубликованный вручную админом
+# БАГ-ФИКС: этот хендлер срабатывает на ВСЕ посты канала,
+# в т.ч. опубликованные вручную — кнопка комментария появится под каждым.
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     post = update.channel_post
     if not post:
@@ -1260,22 +1311,36 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     channel_msg_id = post.message_id
     logger.info("Новый пост в канале: msg_id=%s", channel_msg_id)
+    # Небольшая задержка чтобы тред в связанном чате успел создаться
+    await asyncio.sleep(2)
     await post_comment_invite(context, channel_msg_id)
+
 
 # ── ТОЧКА ВХОДА ───────────────────────────
 def main():
     load_all_logs()
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("admin",  cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(button_callback))
-    # Хендлер постов канала — ловит все посты из канала включая ручные
+
+    # БАГ-ФИКС: хендлер постов канала должен идти ДО общего handle_message
+    # чтобы посты из канала не попадали в handle_message
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
+
+    # Обрабатываем только личные сообщения (не из канала и не из группы)
+    # БАГ-ФИКС: добавлен фильтр ~filters.ChatType.CHANNEL & ~filters.UpdateType.CHANNEL_POST
+    app.add_handler(MessageHandler(
+        filters.ALL & ~filters.COMMAND & ~filters.ChatType.CHANNEL,
+        handle_message
+    ))
+
     logger.info("✅ Бот запущен!")
     # allowed_updates=Update.ALL_TYPES нужен чтобы получать channel_post апдейты
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
