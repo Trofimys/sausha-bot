@@ -91,20 +91,23 @@ CONTENT_CHECK_PROMPT = """
 """.strip()
 
 IMAGE_CHECK_PROMPT = """
-Ты — модератор изображений. Посмотри на изображение и определи:
-- Содержит ли оно порнографию, обнажённое тело, сексуальный контент?
-- Содержит ли оно жестокое насилие, gore, расчленение?
-Модерация НЕ строгая — блокируй только ЯВНО неприемлемое.
-Купальники, пляж, поцелуи — допустимо.
-Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
+Ты — строгий модератор изображений. Посмотри на изображение и определи есть ли там:
+- Обнажённая грудь, ягодицы, гениталии — БЛОКИРОВАТЬ
+- Порнография или сексуальный контент любой степени — БЛОКИРОВАТЬ
+- Нижнее бельё в сексуальном контексте — БЛОКИРОВАТЬ
+- Жестокое насилие, кровь, gore — БЛОКИРОВАТЬ
+Допустимо: купальники на пляже, поцелуи, обычные фото людей.
+Отвечай ТОЛЬКО JSON без пояснений: {"acceptable": true/false, "reason": "причина если false"}.
 """.strip()
 
 VIDEO_CHECK_PROMPT = """
-Ты — модератор. Посмотри на этот кадр из видео и определи:
-- Содержит ли он порнографию, обнажённое тело, сексуальный контент?
-- Содержит ли он жестокое насилие?
-Модерация НЕ строгая — блокируй только ЯВНО неприемлемое.
-Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
+Ты — строгий модератор. Посмотри на этот кадр из видео и определи есть ли там:
+- Обнажённая грудь, ягодицы, гениталии — БЛОКИРОВАТЬ
+- Порнография или сексуальный контент любой степени — БЛОКИРОВАТЬ
+- Нижнее бельё в сексуальном контексте — БЛОКИРОВАТЬ
+- Жестокое насилие, кровь, gore — БЛОКИРОВАТЬ
+Допустимо: купальники на пляже, поцелуи, обычные видео.
+Отвечай ТОЛЬКО JSON без пояснений: {"acceptable": true/false, "reason": "причина если false"}.
 """.strip()
 
 # ── УТИЛИТЫ ───────────────────────────────
@@ -300,7 +303,7 @@ async def call_groq_simple(prompt, system, as_json=False):
 async def call_groq_vision(image_b64: str, prompt: str) -> str | None:
     """Анализ изображения через Groq Vision (llama-4-scout)"""
     payload = {
-        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "model": "meta-llama/llama-4-maverick-17b-128e-instruct",
         "messages": [{
             "role": "user",
             "content": [
@@ -354,58 +357,46 @@ async def download_file_b64(bot, file_id: str, max_size_mb: int = 10) -> str | N
         return None
 
 # ── ИЗВЛЕЧЕНИЕ КАДРА ИЗ ВИДЕО ─────────────
-async def extract_video_frame_b64(bot, file_id: str) -> str | None:
-    """Скачивает видео и извлекает первый кадр через ffmpeg (первые 7 сек)"""
+async def extract_video_frames_b64(bot, file_id: str) -> list[str]:
+    """Скачивает видео и извлекает 7 кадров (по 1 каждую секунду, 0-6 сек)"""
+    frames = []
+    video_path = None
     try:
         tg_file = await bot.get_file(file_id)
-        # Скачиваем видео
         video_bytes = await tg_file.download_as_bytearray()
 
-        # Сохраняем во временный файл
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(bytes(video_bytes))
             video_path = vf.name
 
-        frame_path = video_path + "_frame.jpg"
-
-        # Извлекаем кадр на 3-й секунде (или на 1-й если видео короткое)
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", video_path,
-            "-ss", "00:00:03",
-            "-vframes", "1",
-            "-q:v", "2",
-            frame_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=30)
-
-        # Если на 3 сек нет кадра — берём 1-й кадр
-        if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
-            proc2 = await asyncio.create_subprocess_exec(
+        for sec in range(7):
+            frame_path = f"{video_path}_frame_{sec}.jpg"
+            proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y", "-i", video_path,
+                "-ss", f"00:00:0{sec}",
                 "-vframes", "1",
                 "-q:v", "2",
                 frame_path,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
-            await asyncio.wait_for(proc2.communicate(), timeout=30)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                continue
 
-        if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
-            return None
-
-        with open(frame_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
-
-        # Чистим временные файлы
-        os.unlink(video_path)
-        os.unlink(frame_path)
-        return b64
+            if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
+                with open(frame_path, "rb") as f:
+                    frames.append(base64.b64encode(f.read()).decode("utf-8"))
+                os.unlink(frame_path)
 
     except Exception as e:
-        logger.error("Ошибка извлечения кадра: %s", e)
-        return None
+        logger.error("Ошибка извлечения кадров: %s", e)
+    finally:
+        if video_path and os.path.exists(video_path):
+            os.unlink(video_path)
+
+    return frames
 
 # ── МОДЕРАЦИЯ ─────────────────────────────
 async def is_content_acceptable(text: str) -> tuple[bool, str]:
@@ -435,18 +426,24 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
         return True, ""
 
 async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
-    """Проверка видео через кадр (первые ~3 секунды)"""
+    """Проверка видео — 7 кадров по 1 в секунду, блокируем если хоть один плохой"""
     try:
-        b64 = await extract_video_frame_b64(bot, file_id)
-        if not b64:
-            # ffmpeg недоступен — пробуем скачать как есть (только для gif/маленьких)
+        frames = await extract_video_frames_b64(bot, file_id)
+        if not frames:
             return True, ""
-        res = await call_groq_vision(b64, VIDEO_CHECK_PROMPT)
-        if not res:
-            return True, ""
-        p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
-        ok = bool(p.get("acceptable", True))
-        return ok, ("" if ok else p.get("reason", "неприемлемый контент в видео"))
+        for i, b64 in enumerate(frames):
+            res = await call_groq_vision(b64, VIDEO_CHECK_PROMPT)
+            if not res:
+                continue
+            try:
+                p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
+                if not p.get("acceptable", True):
+                    reason = p.get("reason", "неприемлемый контент в видео")
+                    logger.info("Видео заблокировано на кадре %d: %s", i, reason)
+                    return False, reason
+            except:
+                continue
+        return True, ""
     except Exception as e:
         logger.error("Ошибка проверки видео: %s", e)
         return True, ""
@@ -617,6 +614,7 @@ def admin_keyboard():
          InlineKeyboardButton("📋  Список ID",    callback_data="admin_list_ids")],
         [InlineKeyboardButton("📤  Экспорт CSV",  callback_data="admin_export"),
          InlineKeyboardButton("🧹  Удалить >7д",  callback_data="admin_clean_old")],
+        [InlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
     ])
 
 def admin_text():
@@ -687,6 +685,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_clean_old":
         await clean_old_logs(query)
+
+    elif data == "admin_test_ai":
+        context.user_data["awaiting_test_media"] = True
+        await query.edit_message_text(
+            "🧪 *Тест ИИ модерации*\n\n"
+            "Отправь фото или видео — я проверю через ИИ и скажу:\n"
+            "✅ пропустил бы в канал или 🚫 заблокировал бы\n\n"
+            "_(в канал ничего не отправляется)_\n\n"
+            "/cancel — отмена",
+            parse_mode="Markdown",
+            reply_markup=back_keyboard("admin_back"))
 
     elif data == "admin_back":
         await query.edit_message_text(admin_text(), reply_markup=admin_keyboard())
