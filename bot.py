@@ -30,7 +30,7 @@ if sys.platform == "win32":
 
 BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
-GROQ_API_KEY   = "ВСТАВЬ_НОВЫЙ_GROQ_КЛЮЧ_СЮДА"
+GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
 SE_USER        = "422568370"
 SE_SECRET      = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
