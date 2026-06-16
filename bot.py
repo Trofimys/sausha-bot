@@ -30,10 +30,24 @@ if sys.platform == "win32":
 
 BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
-GROQ_API_KEY   = "ВСТАВЬ_НОВЫЙ_GROQ_КЛЮЧ_СЮДА"
+GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
 SE_USER        = "422568370"
 SE_SECRET      = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
+SE_MONTH_LIMIT = 2000
+
+def se_increment(n: int = 1):
+    """Увеличивает счётчик проверок Sightengine"""
+    key = datetime.now().strftime("%Y-%m")
+    se_checks_month[key] = se_checks_month.get(key, 0) + n
+
+def se_used() -> int:
+    """Возвращает кол-во проверок за текущий месяц"""
+    key = datetime.now().strftime("%Y-%m")
+    return se_checks_month.get(key, 0)
+
+def se_left() -> int:
+    return max(0, SE_MONTH_LIMIT - se_used())
 
 LOG_FILE        = "anon_logs.json"
 START_LOG_FILE  = "start_logs.json"
@@ -52,6 +66,7 @@ message_logs: list[dict] = []
 start_logs:   list[dict] = []
 manual_ids:   list[int]  = []
 top_data:     dict       = {}
+se_checks_month: dict    = {}  # {"2026-06": 42}
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -382,6 +397,7 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
         )
         offensive = data.get("offensive", {}).get("prob", 0)
         logger.info("Sightengine: sexual=%.2f offensive=%.2f", sexual_score, offensive)
+        se_increment(1)
         if sexual_score > 0.5:
             return False, f"сексуальный контент ({int(sexual_score*100)}%)"
         if offensive > 0.7:
@@ -474,6 +490,7 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
         )
         offensive = data.get("offensive", {}).get("prob", 0)
         logger.info("Sightengine фото: sexual=%.2f offensive=%.2f", sexual_score, offensive)
+        se_increment(1)
         if sexual_score > 0.5:
             return False, f"сексуальный контент (уверенность {int(sexual_score*100)}%)"
         if offensive > 0.7:
@@ -494,7 +511,7 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
             vf.write(bytes(video_bytes))
             video_path = vf.name
 
-        for sec in range(7):
+        for sec in [1, 3, 6]:
             frame_path = f"{video_path}_frame_{sec}.jpg"
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y", "-i", video_path,
@@ -537,6 +554,7 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                     )
                     offensive = data.get("offensive", {}).get("prob", 0)
                     logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
+                    se_increment(1)
                     if sexual_score > 0.5:
                         return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score*100)}%)"
                     if offensive > 0.7:
@@ -744,6 +762,9 @@ def admin_text():
         f"👥  Всего пользователей: {len(start_logs)}\n"
         f"🏆  В топе сейчас:       {len(get_top_entries())}\n"
         f"📅  Текущая неделя:      {current_week_key()}\n"
+        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+        f"🔍  Проверок SE в месяц: {se_used()} / {SE_MONTH_LIMIT}\n"
+        f"✅  Осталось проверок:   {se_left()}\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"
     )
 
