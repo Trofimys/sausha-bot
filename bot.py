@@ -30,7 +30,7 @@ if sys.platform == "win32":
 
 BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
-GROQ_API_KEY   = "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"
+GROQ_API_KEY   = "ВСТАВЬ_НОВЫЙ_GROQ_КЛЮЧ_СЮДА"
 ADMIN_ID       = 8627543263
 SE_USER        = "422568370"
 SE_SECRET      = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
@@ -356,6 +356,95 @@ async def _get_tg_file_url(bot, file_id: str) -> str | None:
         logger.error("Ошибка получения URL файла: %s", e)
         return None
 
+async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
+    """Проверяет байты изображения через Sightengine"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                "https://api.sightengine.com/1.0/check.json",
+                data={
+                    "models": "nudity-2.1,offensive",
+                    "api_user": SE_USER,
+                    "api_secret": SE_SECRET,
+                },
+                files={"media": ("image.jpg", image_bytes, "image/jpeg")}
+            )
+        if r.status_code != 200:
+            logger.error("Sightengine error: %s", r.text)
+            return True, ""
+        data = r.json()
+        nudity = data.get("nudity", {})
+        sexual_score = max(
+            nudity.get("sexual_activity", 0),
+            nudity.get("sexual_display", 0),
+            nudity.get("erotica", 0),
+            nudity.get("very_suggestive", 0),
+        )
+        offensive = data.get("offensive", {}).get("prob", 0)
+        logger.info("Sightengine: sexual=%.2f offensive=%.2f", sexual_score, offensive)
+        if sexual_score > 0.5:
+            return False, f"сексуальный контент ({int(sexual_score*100)}%)"
+        if offensive > 0.7:
+            return False, f"оскорбительный контент ({int(offensive*100)}%)"
+        return True, ""
+    except Exception as e:
+        logger.error("Sightengine bytes check error: %s", e)
+        return True, ""
+
+async def _convert_to_jpg_bytes(input_bytes: bytes, suffix: str) -> bytes | None:
+    """Конвертирует любой файл в jpg через ffmpeg"""
+    input_path = None
+    output_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(input_bytes)
+            input_path = f.name
+        output_path = input_path + "_out.jpg"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", input_path,
+            "-vframes", "1", "-q:v", "2", output_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=20)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            with open(output_path, "rb") as f:
+                return f.read()
+        return None
+    except Exception as e:
+        logger.error("ffmpeg конвертация: %s", e)
+        return None
+    finally:
+        for p in [input_path, output_path]:
+            if p and os.path.exists(p):
+                try: os.unlink(p)
+                except: pass
+
+async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
+    """Проверка стикера — статичный/анимированный/видео"""
+    try:
+        tg_file = await bot.get_file(sticker.file_id)
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+
+        if sticker.is_animated:
+            # .tgs — Lottie анимация, конвертируем через ffmpeg
+            jpg = await _convert_to_jpg_bytes(file_bytes, ".tgs")
+        elif sticker.is_video:
+            # .webm видео-стикер
+            jpg = await _convert_to_jpg_bytes(file_bytes, ".webm")
+        else:
+            # .webp статичный — конвертируем в jpg
+            jpg = await _convert_to_jpg_bytes(file_bytes, ".webp")
+
+        if not jpg:
+            logger.warning("Не удалось конвертировать стикер — пропускаем")
+            return True, ""
+
+        return await _sightengine_check_bytes(jpg)
+    except Exception as e:
+        logger.error("Ошибка проверки стикера: %s", e)
+        return True, ""
+
 async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
     """Проверка изображения через Sightengine"""
     try:
@@ -377,7 +466,6 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
             return True, ""
         data = r.json()
         nudity = data.get("nudity", {})
-        # Блокируем если nudity score высокий
         sexual_score = max(
             nudity.get("sexual_activity", 0),
             nudity.get("sexual_display", 0),
@@ -772,7 +860,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ok, reason = await is_image_acceptable(context.bot, msg.photo[-1].file_id)
             elif msg.sticker:
                 ctype = "стикер"
-                ok, reason = await is_image_acceptable(context.bot, msg.sticker.file_id)
+                ok, reason = await is_sticker_acceptable(context.bot, msg.sticker)
             elif msg.video:
                 ctype = "видео"
                 ok, reason = await is_video_acceptable(context.bot, msg.video.file_id)
@@ -930,7 +1018,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Модерация стикеров ──
     elif msg.sticker:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        ok, reason = await is_image_acceptable(context.bot, msg.sticker.file_id)
+        ok, reason = await is_sticker_acceptable(context.bot, msg.sticker)
         if not ok:
             add_message_log({
                 "user_id": uid, "username": update.effective_user.username,
