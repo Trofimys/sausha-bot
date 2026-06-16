@@ -30,7 +30,7 @@ if sys.platform == "win32":
 
 BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
-GROQ_API_KEY   = "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"
+GROQ_API_KEY   = "ВСТАВЬ_НОВЫЙ_GROQ_КЛЮЧ_СЮДА"
 ADMIN_ID       = 8627543263
 SE_USER        = "422568370"
 SE_SECRET      = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
@@ -760,8 +760,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- тест ИИ модерации (админ) ---
     if context.user_data.get("awaiting_test_media") and uid == ADMIN_ID:
         msg = update.message
-        if msg.text and not msg.photo and not msg.video and not msg.animation:
-            await msg.reply_text("⚠️ Отправь фото или видео для теста.")
+        if msg.text and not msg.photo and not msg.video and not msg.animation and not msg.sticker:
+            await msg.reply_text("⚠️ Отправь фото, видео, GIF или стикер для теста.")
             return
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ok, reason = True, ""
@@ -770,6 +770,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if msg.photo:
                 ctype = "фото"
                 ok, reason = await is_image_acceptable(context.bot, msg.photo[-1].file_id)
+            elif msg.sticker:
+                ctype = "стикер"
+                ok, reason = await is_image_acceptable(context.bot, msg.sticker.file_id)
             elif msg.video:
                 ctype = "видео"
                 ok, reason = await is_video_acceptable(context.bot, msg.video.file_id)
@@ -777,7 +780,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ctype = "GIF"
                 ok, reason = await is_video_acceptable(context.bot, msg.animation.file_id)
             else:
-                await msg.reply_text("⚠️ Поддерживается только фото, видео и GIF.")
+                await msg.reply_text("⚠️ Поддерживается только фото, видео, GIF и стикер.")
                 return
         except Exception as e:
             await msg.reply_text(f"❌ Ошибка при проверке: {e}")
@@ -911,8 +914,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Модерация изображений ──
     if msg.photo:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-        file_id = msg.photo[-1].file_id
-        ok, reason = await is_image_acceptable(context.bot, file_id)
+        ok, reason = await is_image_acceptable(context.bot, msg.photo[-1].file_id)
         if not ok:
             add_message_log({
                 "user_id": uid, "username": update.effective_user.username,
@@ -922,12 +924,26 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "timestamp": now.isoformat(), "blocked": reason,
             })
             await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
-            await msg.reply_text(
-                f"🚫 *Изображение не принято*\n\nПричина: {reason}",
-                parse_mode="Markdown")
+            await msg.reply_text(f"🚫 *Изображение не принято*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
-    # ── Модерация видео ──
+    # ── Модерация стикеров ──
+    elif msg.sticker:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        ok, reason = await is_image_acceptable(context.bot, msg.sticker.file_id)
+        if not ok:
+            add_message_log({
+                "user_id": uid, "username": update.effective_user.username,
+                "first_name": update.effective_user.first_name,
+                "last_name":  update.effective_user.last_name,
+                "content_type": ctype, "text": text,
+                "timestamp": now.isoformat(), "blocked": reason,
+            })
+            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await msg.reply_text(f"🚫 *Стикер не принят*\n\nПричина: {reason}", parse_mode="Markdown")
+            return
+
+    # ── Модерация видео и GIF ──
     elif msg.video or msg.animation:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         file_id = msg.video.file_id if msg.video else msg.animation.file_id
@@ -941,9 +957,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "timestamp": now.isoformat(), "blocked": reason,
             })
             await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
-            await msg.reply_text(
-                f"🚫 *Видео не принято*\n\nПричина: {reason}",
-                parse_mode="Markdown")
+            await msg.reply_text(f"🚫 *Видео не принято*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
     # ── Отправка в канал ──
