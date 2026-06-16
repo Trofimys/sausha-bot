@@ -32,6 +32,8 @@ BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
 GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
+SE_USER        = "422568370"
+SE_SECRET      = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
 
 LOG_FILE        = "anon_logs.json"
 START_LOG_FILE  = "start_logs.json"
@@ -343,23 +345,58 @@ async def call_groq_with_context(uid: int, user_msg: str) -> str:
             return "⚠️ Ошибка сети."
 
 # ── СКАЧИВАНИЕ ФАЙЛА ──────────────────────
-async def download_file_b64(bot, file_id: str, max_size_mb: int = 10) -> str | None:
-    """Скачивает файл из Telegram и возвращает base64"""
+# ── SIGHTENGINE МОДЕРАЦИЯ ─────────────────
+async def _get_tg_file_url(bot, file_id: str) -> str | None:
+    """Получает прямую ссылку на файл в Telegram"""
     try:
         tg_file = await bot.get_file(file_id)
-        if tg_file.file_size and tg_file.file_size > max_size_mb * 1024 * 1024:
-            logger.warning("Файл слишком большой: %s байт", tg_file.file_size)
-            return None
-        file_bytes = await tg_file.download_as_bytearray()
-        return base64.b64encode(bytes(file_bytes)).decode("utf-8")
+        return tg_file.file_path if tg_file.file_path.startswith("http") else \
+               f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
     except Exception as e:
-        logger.error("Ошибка скачивания файла: %s", e)
+        logger.error("Ошибка получения URL файла: %s", e)
         return None
 
-# ── ИЗВЛЕЧЕНИЕ КАДРА ИЗ ВИДЕО ─────────────
-async def extract_video_frames_b64(bot, file_id: str) -> list[str]:
-    """Скачивает видео и извлекает 7 кадров (по 1 каждую секунду, 0-6 сек)"""
-    frames = []
+async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
+    """Проверка изображения через Sightengine"""
+    try:
+        url = await _get_tg_file_url(bot, file_id)
+        if not url:
+            return True, ""
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                "https://api.sightengine.com/1.0/check.json",
+                params={
+                    "url": url,
+                    "models": "nudity-2.1,offensive",
+                    "api_user": SE_USER,
+                    "api_secret": SE_SECRET,
+                }
+            )
+        if r.status_code != 200:
+            logger.error("Sightengine error: %s", r.text)
+            return True, ""
+        data = r.json()
+        nudity = data.get("nudity", {})
+        # Блокируем если nudity score высокий
+        sexual_score = max(
+            nudity.get("sexual_activity", 0),
+            nudity.get("sexual_display", 0),
+            nudity.get("erotica", 0),
+            nudity.get("very_suggestive", 0),
+        )
+        offensive = data.get("offensive", {}).get("prob", 0)
+        logger.info("Sightengine фото: sexual=%.2f offensive=%.2f", sexual_score, offensive)
+        if sexual_score > 0.5:
+            return False, f"сексуальный контент (уверенность {int(sexual_score*100)}%)"
+        if offensive > 0.7:
+            return False, f"оскорбительный контент (уверенность {int(offensive*100)}%)"
+        return True, ""
+    except Exception as e:
+        logger.error("Ошибка проверки изображения Sightengine: %s", e)
+        return True, ""
+
+async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
+    """Проверка видео — извлекаем 7 кадров ffmpeg и проверяем каждый через Sightengine"""
     video_path = None
     try:
         tg_file = await bot.get_file(file_id)
@@ -385,20 +422,52 @@ async def extract_video_frames_b64(bot, file_id: str) -> list[str]:
             except asyncio.TimeoutError:
                 continue
 
-            if os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
-                with open(frame_path, "rb") as f:
-                    frames.append(base64.b64encode(f.read()).decode("utf-8"))
-                os.unlink(frame_path)
+            if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+                continue
 
+            # Проверяем кадр через Sightengine (загружаем файл напрямую)
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    with open(frame_path, "rb") as f:
+                        r = await client.post(
+                            "https://api.sightengine.com/1.0/check.json",
+                            data={
+                                "models": "nudity-2.1,offensive",
+                                "api_user": SE_USER,
+                                "api_secret": SE_SECRET,
+                            },
+                            files={"media": f}
+                        )
+                if r.status_code == 200:
+                    data = r.json()
+                    nudity = data.get("nudity", {})
+                    sexual_score = max(
+                        nudity.get("sexual_activity", 0),
+                        nudity.get("sexual_display", 0),
+                        nudity.get("erotica", 0),
+                        nudity.get("very_suggestive", 0),
+                    )
+                    offensive = data.get("offensive", {}).get("prob", 0)
+                    logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
+                    if sexual_score > 0.5:
+                        return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score*100)}%)"
+                    if offensive > 0.7:
+                        return False, f"оскорбительный контент на {sec}-й секунде ({int(offensive*100)}%)"
+            except Exception as e:
+                logger.error("Ошибка Sightengine кадр %d: %s", sec, e)
+            finally:
+                if os.path.exists(frame_path):
+                    os.unlink(frame_path)
+
+        return True, ""
     except Exception as e:
-        logger.error("Ошибка извлечения кадров: %s", e)
+        logger.error("Ошибка проверки видео: %s", e)
+        return True, ""
     finally:
         if video_path and os.path.exists(video_path):
             os.unlink(video_path)
 
-    return frames
-
-# ── МОДЕРАЦИЯ ─────────────────────────────
+# ── МОДЕРАЦИЯ ТЕКСТА ──────────────────────
 async def is_content_acceptable(text: str) -> tuple[bool, str]:
     if not text or len(text.strip()) < 2: return False, "слишком короткое"
     res = await call_groq_simple(text, CONTENT_CHECK_PROMPT, as_json=True)
@@ -408,45 +477,6 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
         ok = bool(p.get("acceptable", True))
         return ok, ("" if ok else p.get("reason",""))
     except: return True, ""
-
-async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
-    """Проверка изображения через Groq Vision"""
-    try:
-        b64 = await download_file_b64(bot, file_id)
-        if not b64:
-            return True, ""  # Если не смогли скачать — пропускаем
-        res = await call_groq_vision(b64, IMAGE_CHECK_PROMPT)
-        if not res:
-            return True, ""
-        p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
-        ok = bool(p.get("acceptable", True))
-        return ok, ("" if ok else p.get("reason", "неприемлемый контент"))
-    except Exception as e:
-        logger.error("Ошибка проверки изображения: %s", e)
-        return True, ""
-
-async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
-    """Проверка видео — 7 кадров по 1 в секунду, блокируем если хоть один плохой"""
-    try:
-        frames = await extract_video_frames_b64(bot, file_id)
-        if not frames:
-            return True, ""
-        for i, b64 in enumerate(frames):
-            res = await call_groq_vision(b64, VIDEO_CHECK_PROMPT)
-            if not res:
-                continue
-            try:
-                p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
-                if not p.get("acceptable", True):
-                    reason = p.get("reason", "неприемлемый контент в видео")
-                    logger.info("Видео заблокировано на кадре %d: %s", i, reason)
-                    return False, reason
-            except:
-                continue
-        return True, ""
-    except Exception as e:
-        logger.error("Ошибка проверки видео: %s", e)
-        return True, ""
 
 # ── АНИМАЦИЯ ПЕЧАТАНИЯ ────────────────────
 async def typewriter_reply(update: Update, full_text: str):
