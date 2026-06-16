@@ -7,6 +7,8 @@ import os
 import sys
 import csv
 import io
+import base64
+import tempfile
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
@@ -28,7 +30,7 @@ if sys.platform == "win32":
 
 BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
-GROQ_API_KEY   = "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"
+GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
 
 LOG_FILE        = "anon_logs.json"
@@ -42,7 +44,7 @@ TYPING_DELAY     = 0.015
 UPDATE_INTERVAL  = 5
 GROQ_SEMAPHORE   = asyncio.Semaphore(5)
 
-user_last_time: dict[int, datetime]   = {}
+user_last_time: dict[int, datetime]    = {}
 user_ai_context: dict[int, list[dict]] = {}
 message_logs: list[dict] = []
 start_logs:   list[dict] = []
@@ -80,9 +82,28 @@ SYSTEM_PROMPT = """
 """.strip()
 
 CONTENT_CHECK_PROMPT = """
-Ты — строгий модератор. Оцени текст сообщения по двум критериям:
-1) Осмысленность: сообщение должно выражать связную мысль (вопрос, шутку, эмоцию, приветствие, комментарий), а не быть случайным набором букв/цифр/эмодзи.
-2) Не спам: в нём не должно быть ссылок, рекламы, призывов перейти куда-либо.
+Ты — модератор. Оцени текст сообщения:
+1) Осмысленность: сообщение должно выражать связную мысль, а не быть случайным набором символов.
+2) Не спам: нет ссылок, рекламы, призывов перейти куда-либо.
+3) Не содержит явной порнографии или очень грубого контента (мат в умеренном количестве допустим).
+Модерация НЕ строгая — блокируй только явно неприемлемое.
+Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
+""".strip()
+
+IMAGE_CHECK_PROMPT = """
+Ты — модератор изображений. Посмотри на изображение и определи:
+- Содержит ли оно порнографию, обнажённое тело, сексуальный контент?
+- Содержит ли оно жестокое насилие, gore, расчленение?
+Модерация НЕ строгая — блокируй только ЯВНО неприемлемое.
+Купальники, пляж, поцелуи — допустимо.
+Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
+""".strip()
+
+VIDEO_CHECK_PROMPT = """
+Ты — модератор. Посмотри на этот кадр из видео и определи:
+- Содержит ли он порнографию, обнажённое тело, сексуальный контент?
+- Содержит ли он жестокое насилие?
+Модерация НЕ строгая — блокируй только ЯВНО неприемлемое.
 Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
 """.strip()
 
@@ -246,7 +267,7 @@ def build_top_text() -> str:
 # ── GROQ API ──────────────────────────────
 async def _groq_request(payload, retries=2):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         for attempt in range(retries + 1):
             try:
                 r = await client.post(
@@ -276,6 +297,31 @@ async def call_groq_simple(prompt, system, as_json=False):
         return d["choices"][0]["message"]["content"] if d else None
     except Exception as e: logger.error("Groq simple: %s", e); return None
 
+async def call_groq_vision(image_b64: str, prompt: str) -> str | None:
+    """Анализ изображения через Groq Vision (llama-4-scout)"""
+    payload = {
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                },
+                {"type": "text", "text": prompt}
+            ]
+        }],
+        "temperature": 0.1,
+        "max_tokens": 256,
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        d = await _groq_request(payload, retries=2)
+        return d["choices"][0]["message"]["content"] if d else None
+    except Exception as e:
+        logger.error("Groq vision: %s", e)
+        return None
+
 async def call_groq_with_context(uid: int, user_msg: str) -> str:
     async with GROQ_SEMAPHORE:
         history = user_ai_context.setdefault(uid, [])
@@ -293,16 +339,117 @@ async def call_groq_with_context(uid: int, user_msg: str) -> str:
             logger.error("Groq ctx: %s", e)
             return "⚠️ Ошибка сети."
 
-# ── ПРОВЕРКА КОНТЕНТА ─────────────────────
+# ── СКАЧИВАНИЕ ФАЙЛА ──────────────────────
+async def download_file_b64(bot, file_id: str, max_size_mb: int = 10) -> str | None:
+    """Скачивает файл из Telegram и возвращает base64"""
+    try:
+        tg_file = await bot.get_file(file_id)
+        if tg_file.file_size and tg_file.file_size > max_size_mb * 1024 * 1024:
+            logger.warning("Файл слишком большой: %s байт", tg_file.file_size)
+            return None
+        file_bytes = await tg_file.download_as_bytearray()
+        return base64.b64encode(bytes(file_bytes)).decode("utf-8")
+    except Exception as e:
+        logger.error("Ошибка скачивания файла: %s", e)
+        return None
+
+# ── ИЗВЛЕЧЕНИЕ КАДРА ИЗ ВИДЕО ─────────────
+async def extract_video_frame_b64(bot, file_id: str) -> str | None:
+    """Скачивает видео и извлекает первый кадр через ffmpeg (первые 7 сек)"""
+    try:
+        tg_file = await bot.get_file(file_id)
+        # Скачиваем видео
+        video_bytes = await tg_file.download_as_bytearray()
+
+        # Сохраняем во временный файл
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(bytes(video_bytes))
+            video_path = vf.name
+
+        frame_path = video_path + "_frame.jpg"
+
+        # Извлекаем кадр на 3-й секунде (или на 1-й если видео короткое)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", video_path,
+            "-ss", "00:00:03",
+            "-vframes", "1",
+            "-q:v", "2",
+            frame_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+
+        # Если на 3 сек нет кадра — берём 1-й кадр
+        if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+            proc2 = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", video_path,
+                "-vframes", "1",
+                "-q:v", "2",
+                frame_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await asyncio.wait_for(proc2.communicate(), timeout=30)
+
+        if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+            return None
+
+        with open(frame_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # Чистим временные файлы
+        os.unlink(video_path)
+        os.unlink(frame_path)
+        return b64
+
+    except Exception as e:
+        logger.error("Ошибка извлечения кадра: %s", e)
+        return None
+
+# ── МОДЕРАЦИЯ ─────────────────────────────
 async def is_content_acceptable(text: str) -> tuple[bool, str]:
     if not text or len(text.strip()) < 2: return False, "слишком короткое"
     res = await call_groq_simple(text, CONTENT_CHECK_PROMPT, as_json=True)
     if not res: return True, ""
     try:
         p  = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
-        ok = bool(p.get("acceptable", False))
+        ok = bool(p.get("acceptable", True))
         return ok, ("" if ok else p.get("reason",""))
     except: return True, ""
+
+async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
+    """Проверка изображения через Groq Vision"""
+    try:
+        b64 = await download_file_b64(bot, file_id)
+        if not b64:
+            return True, ""  # Если не смогли скачать — пропускаем
+        res = await call_groq_vision(b64, IMAGE_CHECK_PROMPT)
+        if not res:
+            return True, ""
+        p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
+        ok = bool(p.get("acceptable", True))
+        return ok, ("" if ok else p.get("reason", "неприемлемый контент"))
+    except Exception as e:
+        logger.error("Ошибка проверки изображения: %s", e)
+        return True, ""
+
+async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
+    """Проверка видео через кадр (первые ~3 секунды)"""
+    try:
+        b64 = await extract_video_frame_b64(bot, file_id)
+        if not b64:
+            # ffmpeg недоступен — пробуем скачать как есть (только для gif/маленьких)
+            return True, ""
+        res = await call_groq_vision(b64, VIDEO_CHECK_PROMPT)
+        if not res:
+            return True, ""
+        p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
+        ok = bool(p.get("acceptable", True))
+        return ok, ("" if ok else p.get("reason", "неприемлемый контент в видео"))
+    except Exception as e:
+        logger.error("Ошибка проверки видео: %s", e)
+        return True, ""
 
 # ── АНИМАЦИЯ ПЕЧАТАНИЯ ────────────────────
 async def typewriter_reply(update: Update, full_text: str):
@@ -354,20 +501,23 @@ async def send_to_channel(context, update, text) -> int | None:
         return None
 
 # ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
-async def notify_admin_silent(context, update, ctype, ctext):
+async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None):
     u    = update.effective_user
     ustr = f"@{u.username}" if u.username else "—"
     name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "—"
     safe_ustr = ustr.replace("_","\_").replace("*","\*").replace("`","\`")
     safe_name = name.replace("_","\_").replace("*","\*").replace("`","\`")
+    ico  = "🚫" if blocked_reason else "🕵️"
     lines = [
-        "🕵️ *Новая анонимка*",
+        f"{ico} *{'ЗАБЛОКИРОВАНО' if blocked_reason else 'Новая анонимка'}*",
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
         f"👤 ID: `{u.id}`",
         f"🔗 Username: {safe_ustr}",
         f"📛 Имя: {safe_name}",
         f"📎 Тип: {ctype}",
     ]
+    if blocked_reason:
+        lines.append(f"❌ Причина блока: {blocked_reason}")
     if ctext:
         safe_text = ctext[:300].replace("`", "'")
         lines.append(f"💬 Текст:\n`{safe_text}`")
@@ -567,7 +717,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
 
-    # --- ник для топа ---
     if context.user_data.get("awaiting_top_nick"):
         nick = (update.message.text or "").strip()
         if not nick or len(nick) > 32:
@@ -584,7 +733,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=top_keyboard(uid))
         return
 
-    # --- добавление ID (админ) ---
     if context.user_data.get("awaiting_ids") and uid == ADMIN_ID:
         text    = (update.message.text or "").strip()
         new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
@@ -604,7 +752,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_ids", None)
         return
 
-    # --- рассылка (админ) ---
     if context.user_data.get("awaiting_broadcast") and uid == ADMIN_ID:
         txt = update.message.text
         if not txt:
@@ -638,38 +785,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── АНОНИМКА ──────────────────────────────
 async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
-    text = update.message.text or update.message.caption or ""
+    msg  = update.message
+    text = msg.text or msg.caption or ""
     now  = datetime.now()
 
     last = user_last_time.get(uid)
     if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
         rem  = int(COOLDOWN_SECONDS - (now - last).total_seconds())
         m, s = divmod(rem, 60)
-        await update.message.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
+        await msg.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
         return
 
-    if text.strip():
-        ok, reason = await is_content_acceptable(text)
-        if not ok:
-            add_message_log({
-                "user_id": uid, "username": update.effective_user.username,
-                "first_name": update.effective_user.first_name,
-                "last_name":  update.effective_user.last_name,
-                "content_type": "текст", "text": text,
-                "timestamp": now.isoformat(), "blocked": reason,
-            })
-            await update.message.reply_text(
-                f"🚫 *Сообщение не принято*\n\nПричина: {reason}",
-                parse_mode="Markdown")
-            return
-
-    mid = await send_to_channel(context, update, text)
-    if mid is None:
-        await update.message.reply_text("❌ Не удалось отправить. Попробуй позже.")
-        return
-
-    user_last_time[uid] = now
-    msg   = update.message
+    # Определяем тип контента
     ctype = ("фото"      if msg.photo     else
              "видео"     if msg.video     else
              "GIF"       if msg.animation else
@@ -678,6 +805,68 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "документ"  if msg.document  else
              "стикер"    if msg.sticker   else "текст")
 
+    # ── Модерация текста ──
+    if text.strip():
+        ok, reason = await is_content_acceptable(text)
+        if not ok:
+            add_message_log({
+                "user_id": uid, "username": update.effective_user.username,
+                "first_name": update.effective_user.first_name,
+                "last_name":  update.effective_user.last_name,
+                "content_type": ctype, "text": text,
+                "timestamp": now.isoformat(), "blocked": reason,
+            })
+            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await msg.reply_text(
+                f"🚫 *Сообщение не принято*\n\nПричина: {reason}",
+                parse_mode="Markdown")
+            return
+
+    # ── Модерация изображений ──
+    if msg.photo:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        file_id = msg.photo[-1].file_id
+        ok, reason = await is_image_acceptable(context.bot, file_id)
+        if not ok:
+            add_message_log({
+                "user_id": uid, "username": update.effective_user.username,
+                "first_name": update.effective_user.first_name,
+                "last_name":  update.effective_user.last_name,
+                "content_type": ctype, "text": text,
+                "timestamp": now.isoformat(), "blocked": reason,
+            })
+            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await msg.reply_text(
+                f"🚫 *Изображение не принято*\n\nПричина: {reason}",
+                parse_mode="Markdown")
+            return
+
+    # ── Модерация видео ──
+    elif msg.video or msg.animation:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        file_id = msg.video.file_id if msg.video else msg.animation.file_id
+        ok, reason = await is_video_acceptable(context.bot, file_id)
+        if not ok:
+            add_message_log({
+                "user_id": uid, "username": update.effective_user.username,
+                "first_name": update.effective_user.first_name,
+                "last_name":  update.effective_user.last_name,
+                "content_type": ctype, "text": text,
+                "timestamp": now.isoformat(), "blocked": reason,
+            })
+            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await msg.reply_text(
+                f"🚫 *Видео не принято*\n\nПричина: {reason}",
+                parse_mode="Markdown")
+            return
+
+    # ── Отправка в канал ──
+    mid = await send_to_channel(context, update, text)
+    if mid is None:
+        await msg.reply_text("❌ Не удалось отправить. Попробуй позже.")
+        return
+
+    user_last_time[uid] = now
     add_message_log({
         "user_id": uid, "username": update.effective_user.username,
         "first_name": update.effective_user.first_name,
@@ -689,7 +878,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     increment_top(uid)
     await notify_admin_silent(context, update, ctype, text)
 
-    await update.message.reply_text(
+    await msg.reply_text(
         "✅ *Анонимка отправлена!*\n\n"
         "Твоё сообщение опубликовано в канале 🎉\n"
         "Никто не знает что это ты 🔒",
@@ -874,7 +1063,7 @@ async def show_start_logs_page(query, page):
 async def export_logs_csv(query):
     buf = io.StringIO()
     w   = csv.DictWriter(buf, fieldnames=["user_id","username","first_name","last_name",
-                                          "content_type","text","timestamp"])
+                                          "content_type","text","timestamp","blocked"])
     w.writeheader()
     for row in message_logs:
         w.writerow({k: row.get(k, "") for k in w.fieldnames})
