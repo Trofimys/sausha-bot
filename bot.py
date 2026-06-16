@@ -600,7 +600,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     popped = (context.user_data.pop("awaiting_broadcast", None)
-              or context.user_data.pop("awaiting_ids", None))
+              or context.user_data.pop("awaiting_ids", None)
+              or context.user_data.pop("awaiting_test_media", None))
     await update.message.reply_text("✅ Отменено." if popped else "Нечего отменять.")
 
 # ── АДМИН-ПАНЕЛЬ ──────────────────────────
@@ -726,6 +727,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
 
+    # --- тест ИИ модерации (админ) ---
+    if context.user_data.get("awaiting_test_media") and uid == ADMIN_ID:
+        msg = update.message
+        if msg.text and not msg.photo and not msg.video and not msg.animation:
+            await msg.reply_text("⚠️ Отправь фото или видео для теста.")
+            return
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        ok, reason = True, ""
+        ctype = "неизвестно"
+        try:
+            if msg.photo:
+                ctype = "фото"
+                ok, reason = await is_image_acceptable(context.bot, msg.photo[-1].file_id)
+            elif msg.video:
+                ctype = "видео"
+                ok, reason = await is_video_acceptable(context.bot, msg.video.file_id)
+            elif msg.animation:
+                ctype = "GIF"
+                ok, reason = await is_video_acceptable(context.bot, msg.animation.file_id)
+            else:
+                await msg.reply_text("⚠️ Поддерживается только фото, видео и GIF.")
+                return
+        except Exception as e:
+            await msg.reply_text(f"❌ Ошибка при проверке: {e}")
+            context.user_data.pop("awaiting_test_media", None)
+            return
+
+        context.user_data.pop("awaiting_test_media", None)
+
+        if ok:
+            await msg.reply_text(
+                f"✅ *ИИ пропустил бы это {ctype} в канал*\n\n"
+                f"Контент признан приемлемым.",
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard())
+        else:
+            await msg.reply_text(
+                f"🚫 *ИИ заблокировал бы это {ctype}*\n\n"
+                f"Причина: {reason}",
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard())
+        return
+
+    # --- ник для топа ---
     if context.user_data.get("awaiting_top_nick"):
         nick = (update.message.text or "").strip()
         if not nick or len(nick) > 32:
@@ -742,6 +787,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=top_keyboard(uid))
         return
 
+    # --- добавление ID (админ) ---
     if context.user_data.get("awaiting_ids") and uid == ADMIN_ID:
         text    = (update.message.text or "").strip()
         new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
@@ -761,6 +807,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_ids", None)
         return
 
+    # --- рассылка (админ) ---
     if context.user_data.get("awaiting_broadcast") and uid == ADMIN_ID:
         txt = update.message.text
         if not txt:
