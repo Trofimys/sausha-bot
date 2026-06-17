@@ -28,7 +28,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
+BOT_TOKEN      = "8237768266:AAFXmKfCDCmMjuS4z66jHoob7kDDbkKKadg"
 CHANNEL_ID     = -1003854171715
 GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
