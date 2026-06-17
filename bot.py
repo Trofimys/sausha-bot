@@ -1003,23 +1003,6 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
              "документ"  if msg.document  else
              "стикер"    if msg.sticker   else "текст")
 
-    # ── Модерация текста ──
-    if text.strip():
-        ok, reason = await is_content_acceptable(text)
-        if not ok:
-            add_message_log({
-                "user_id": uid, "username": update.effective_user.username,
-                "first_name": update.effective_user.first_name,
-                "last_name":  update.effective_user.last_name,
-                "content_type": ctype, "text": text,
-                "timestamp": now.isoformat(), "blocked": reason,
-            })
-            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
-            await msg.reply_text(
-                f"🚫 *Сообщение не принято*\n\nПричина: {reason}",
-                parse_mode="Markdown")
-            return
-
     # ── Модерация изображений ──
     if msg.photo:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
