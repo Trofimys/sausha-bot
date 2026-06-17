@@ -28,7 +28,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-BOT_TOKEN      = "8237768266:AAFXmKfCDCmMjuS4z66jHoob7kDDbkKKadg"
+BOT_TOKEN      = "8237768266:AAEj4PP3EJF7ORMK2ydjMyV7OYFunVoSI-w"
 CHANNEL_ID     = -1003854171715
 GROQ_API_KEY   = "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"
 ADMIN_ID       = 8627543263
@@ -654,8 +654,26 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
     if ctext:
         safe_text = ctext[:300].replace("`", "'")
         lines.append(f"💬 Текст:\n`{safe_text}`")
+
+    caption = "\n".join(lines)
+    msg = update.message
+    bot = context.bot
     try:
-        await context.bot.send_message(ADMIN_ID, "\n".join(lines), parse_mode="Markdown")
+        # Если заблокировано — шлём само медиа админу
+        if blocked_reason:
+            if msg.photo:
+                await bot.send_photo(ADMIN_ID, msg.photo[-1].file_id, caption=caption, parse_mode="Markdown")
+            elif msg.video:
+                await bot.send_video(ADMIN_ID, msg.video.file_id, caption=caption, parse_mode="Markdown")
+            elif msg.animation:
+                await bot.send_animation(ADMIN_ID, msg.animation.file_id, caption=caption, parse_mode="Markdown")
+            elif msg.sticker:
+                await bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
+                await bot.send_sticker(ADMIN_ID, msg.sticker.file_id)
+            else:
+                await bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
+        else:
+            await bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
     except Exception as e:
         logger.error("Админ-уведомление: %s", e)
 
