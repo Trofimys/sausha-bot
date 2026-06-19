@@ -1714,6 +1714,8 @@ async def clean_old_logs(query):
 
 async def run_bot1():
     """Запускает бота 1 (aiogram) — анонимные комментарии к постам"""
+    # Сбрасываем webhook и pending updates, чтобы избежать конфликтов
+    await bot1.delete_webhook(drop_pending_updates=True)
     logger.info("[Bot1] Анонимные комментарии запущены!")
     await bot1_dp.start_polling(bot1)
 
@@ -1721,19 +1723,23 @@ async def run_bot1():
 def run_bot2():
     """Запускает бота 2 (PTB) — анонимные сообщения + админка"""
     load_all_logs()
-    app = PTBApplication.builder().token(BOT2_TOKEN).build()
-
-    app.add_handler(PTBCommandHandler("start", bot2_cmd_start))
-    app.add_handler(PTBCommandHandler("admin", bot2_cmd_admin))
-    app.add_handler(PTBCommandHandler("cancel", bot2_cmd_cancel))
-    app.add_handler(PTBCallbackQueryHandler(bot2_button_callback))
-    app.add_handler(PTBMessageHandler(
-        PTBfilters.ALL & ~PTBfilters.COMMAND & ~PTBfilters.ChatType.CHANNEL,
-        bot2_handle_message
-    ))
-
-    logger.info("[Bot2] Анонимные сообщения + админка запущены!")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # Создаём отдельный event loop для этого потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        app = PTBApplication.builder().token(BOT2_TOKEN).build()
+        app.add_handler(PTBCommandHandler("start", bot2_cmd_start))
+        app.add_handler(PTBCommandHandler("admin", bot2_cmd_admin))
+        app.add_handler(PTBCommandHandler("cancel", bot2_cmd_cancel))
+        app.add_handler(PTBCallbackQueryHandler(bot2_button_callback))
+        app.add_handler(PTBMessageHandler(
+            PTBfilters.ALL & ~PTBfilters.COMMAND & ~PTBfilters.ChatType.CHANNEL,
+            bot2_handle_message
+        ))
+        logger.info("[Bot2] Анонимные сообщения + админка запущены!")
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    finally:
+        loop.close()
 
 
 async def main():
