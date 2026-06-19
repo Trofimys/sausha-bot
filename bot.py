@@ -1,81 +1,410 @@
+import os
+import asyncio
 import logging
+import random
 import re
 import json
 import httpx
-import asyncio
-import os
 import sys
 import csv
 import io
 import base64
 import tempfile
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    CallbackQueryHandler,
-)
 import threading
 import time
 import urllib.request
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ── aiogram (бот 1: анонимные комментарии) ──
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# ── python-telegram-bot (бот 2: анонимные сообщения + админка) ──
+from telegram import Update, InlineKeyboardButton as PTBInlineKeyboardButton, InlineKeyboardMarkup as PTBInlineKeyboardMarkup
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application as PTBApplication,
+    CommandHandler as PTBCommandHandler,
+    MessageHandler as PTBMessageHandler,
+    ContextTypes as PTBContextTypes,
+    filters as PTBfilters,
+    CallbackQueryHandler as PTBCallbackQueryHandler,
+)
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-BOT_TOKEN      = "8237768266:AAFXmKfCDCmMjuS4z66jHoob7kDDbkKKadg"
-CHANNEL_ID     = -1003854171715
-GROQ_API_KEY   = "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"
-ADMIN_ID       = 8627543263
-SE_USER        = "422568370"
-SE_SECRET      = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
+# ═══════════════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ
+# ═══════════════════════════════════════════════════════════════════
+
+# Бот 1: Анонимные комментарии к постам канала
+BOT1_TOKEN = "8738254043:AAGA5i3JpqnNAmMnsXAVl8amHTKYNKk4bak"
+BOT1_CHANNEL_ID = -1003854171715
+BOT1_DISCUSSION_CHAT_ID = -1003718571364
+
+# Бот 2: Анонимные сообщения в канал
+BOT2_TOKEN = "8237768266:AAFXmKfCDCmMjuS4z66jHoob7kDDbkKKadg"
+BOT2_CHANNEL_ID = -1003854171715
+GROQ_API_KEY = "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"
+ADMIN_ID = 8627543263
+SE_USER = "422568370"
+SE_SECRET = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
 SE_MONTH_LIMIT = 2000
 
-def se_increment(n: int = 1):
-    """Увеличивает счётчик проверок Sightengine"""
-    key = datetime.now().strftime("%Y-%m")
-    se_checks_month[key] = se_checks_month.get(key, 0) + n
-
-def se_used() -> int:
-    """Возвращает кол-во проверок за текущий месяц"""
-    key = datetime.now().strftime("%Y-%m")
-    return se_checks_month.get(key, 0)
-
-def se_left() -> int:
-    return max(0, SE_MONTH_LIMIT - se_used())
-
-LOG_FILE        = "anon_logs.json"
-START_LOG_FILE  = "start_logs.json"
-MANUAL_IDS_FILE = "manual_ids.json"
-TOP_FILE        = "top_data.json"
-
-COOLDOWN_SECONDS = 180
-ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
-TYPING_DELAY     = 0.015
-UPDATE_INTERVAL  = 5
-GROQ_SEMAPHORE   = asyncio.Semaphore(5)
-
-user_last_time: dict[int, datetime]    = {}
-user_ai_context: dict[int, list[dict]] = {}
-message_logs: list[dict] = []
-start_logs:   list[dict] = []
-manual_ids:   list[int]  = []
-top_data:     dict       = {}
-se_checks_month: dict    = {}  # {"2026-06": 42}
+# ═══════════════════════════════════════════════════════════════════
+# ЛОГИРОВАНИЕ
+# ═══════════════════════════════════════════════════════════════════
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════════
+# БОТ 1: АНОНИМНЫЕ КОММЕНТАРИИ К ПОСТАМ КАНАЛА
+# ═══════════════════════════════════════════════════════════════════
+
+EMOJI_POOL = [
+    "🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯",
+    "🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🦆","🦅",
+    "🦉","🦇","🐺","🐗","🐴","🦄","🐝","🦋","🐌","🐞",
+    "🐜","🐢","🐍","🦎","🐙","🦑","🦐","🦀","🐡","🐠",
+    "🐟","🐬","🐳","🦈","🐊","🐅","🐆","🦓","🦍","🐘",
+    "🦛","🦏","🐪","🦒","🦘","🐃","🦌","🐑","🦙","🐕",
+    "🐈","🦃","🦚","🦜","🦢","🦩","🕊","🐇","🦝","🦨",
+    "🦡","🦦","🦥","🐁","🐀","🐿","🦔","🌸","🌺","🌻",
+    "🍀","🌈","⭐","🌙","☀️","❄️","🔥","💧","🌊","🌿"
+]
+PSEUDO_LEN = 4
+
+class AnonState(StatesGroup):
+    waiting_text = State()
+
+# Хранилища бота 1
+bot1_user_pseudos: dict[int, dict[int, str]] = {}
+bot1_pending: dict[int, tuple[int, int]] = {}  # user_id -> (post_id, reply_to_msg_id)
+bot1_post_to_discussion_id: dict[int, int] = {}
+bot1_anon_msg_to_user: dict[int, int] = {}
+bot1_anon_msg_to_post: dict[int, int] = {}
+bot1_reply_msg_to_post: dict[int, int] = {}  # message_id ответа человека -> post_id
+
+bot1 = Bot(token=BOT1_TOKEN)
+bot1_dp = Dispatcher(storage=MemoryStorage())
+bot1_username_cache = None
+
+
+async def bot1_get_username():
+    global bot1_username_cache
+    if not bot1_username_cache:
+        me = await bot1.get_me()
+        bot1_username_cache = me.username
+    return bot1_username_cache
+
+
+def bot1_get_pseudo(user_id: int, post_id: int) -> str:
+    if user_id not in bot1_user_pseudos:
+        bot1_user_pseudos[user_id] = {}
+    if post_id not in bot1_user_pseudos[user_id]:
+        rng = random.Random(f"{user_id}:{post_id}:{os.urandom(4).hex()}")
+        chosen = rng.sample(EMOJI_POOL, PSEUDO_LEN)
+        bot1_user_pseudos[user_id][post_id] = "".join(chosen)
+    return bot1_user_pseudos[user_id][post_id]
+
+
+@bot1_dp.message(lambda m: m.chat.id == BOT1_DISCUSSION_CHAT_ID and m.forward_from_chat is not None and m.forward_from_chat.id == BOT1_CHANNEL_ID)
+async def bot1_on_discussion_forward(message: Message):
+    channel_post_id = message.forward_from_message_id
+    bot1_post_to_discussion_id[channel_post_id] = message.message_id
+    logger.info(f"[Bot1] Форвард поста {channel_post_id} -> discussion {message.message_id}")
+
+
+@bot1_dp.channel_post()
+async def bot1_on_channel_post(message: Message):
+    if message.chat.id != BOT1_CHANNEL_ID:
+        return
+
+    post_id = message.message_id
+    logger.info(f"[Bot1] Новый пост: {post_id}")
+    await asyncio.sleep(5)
+
+    username = await bot1_get_username()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="• • •", url=f"https://t.me/{username}?start=post_{post_id}")
+    ]])
+
+    discussion_msg_id = bot1_post_to_discussion_id.get(post_id)
+    logger.info(f"[Bot1] Отправляю промпт, discussion_msg_id={discussion_msg_id}")
+
+    try:
+        sent = await bot1.send_message(
+            chat_id=BOT1_DISCUSSION_CHAT_ID,
+            text="🤖 Чтобы оставить анонимный комментарий к этому посту, нажмите на кнопку:",
+            reply_markup=kb,
+            reply_to_message_id=discussion_msg_id
+        )
+        logger.info(f"[Bot1] Промпт успешно отправлен: {sent.message_id}")
+    except Exception as e:
+        logger.error(f"[Bot1] Ошибка с reply: {e}, пробуем без reply")
+        try:
+            sent = await bot1.send_message(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                text="🤖 Чтобы оставить анонимный комментарий к этому посту, нажмите на кнопку:",
+                reply_markup=kb
+            )
+            logger.info(f"[Bot1] Промпт отправлен без reply: {sent.message_id}")
+        except Exception as e2:
+            logger.error(f"[Bot1] Совсем не удалось отправить: {e2}")
+
+
+@bot1_dp.message(lambda m: m.chat.id == BOT1_DISCUSSION_CHAT_ID and m.reply_to_message is not None and not m.from_user.is_bot)
+async def bot1_on_discussion_reply(message: Message):
+    """Кто-то ответил на сообщение в чате — проверяем, не анонимка ли это."""
+    replied_to_id = message.reply_to_message.message_id
+
+    if replied_to_id not in bot1_anon_msg_to_user:
+        return
+
+    original_author_id = bot1_anon_msg_to_user[replied_to_id]
+    post_id = bot1_anon_msg_to_post.get(replied_to_id)
+    replier_name = message.from_user.full_name
+
+    # Сохраняем связь: message_id ответа человека -> post_id
+    bot1_reply_msg_to_post[message.message_id] = post_id
+
+    username = await bot1_get_username()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="Ответить • • •",
+            url=f"https://t.me/{username}?start=reply_{message.message_id}"
+        )
+    ]])
+
+    try:
+        await bot1.send_message(
+            chat_id=original_author_id,
+            text=f"<b>{replier_name}</b> ответил(а) на ваш анонимный комментарий",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"[Bot1] Не удалось отправить уведомление: {e}")
+
+
+@bot1_dp.message(Command("start"))
+async def bot1_cmd_start(message: Message, state: FSMContext):
+    args = message.text.split(maxsplit=1)
+    if len(args) > 1:
+        param = args[1]
+        
+        if param.startswith("reply_"):
+            try:
+                reply_to_msg_id = int(param.replace("reply_", ""))
+                post_id = bot1_reply_msg_to_post.get(reply_to_msg_id)
+                if not post_id:
+                    await message.answer("Сообщение устарело или не найдено.")
+                    return
+            except ValueError:
+                await message.answer("Неверная ссылка.")
+                return
+                
+        elif param.startswith("post_"):
+            try:
+                post_id = int(param.replace("post_", ""))
+                reply_to_msg_id = bot1_post_to_discussion_id.get(post_id)
+            except ValueError:
+                await message.answer("Неверная ссылка.")
+                return
+        else:
+            await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
+            return
+
+        bot1_pending[message.from_user.id] = (post_id, reply_to_msg_id)
+        await state.set_state(AnonState.waiting_text)
+        await message.answer(
+            "👋 Отправьте сообщение, и я опубликую его анонимно в комментариях. "
+            "Можно отправлять текст, фото, видео, GIF, стикеры, аудио и файлы.\n\n"
+            "/cancel — отменить отправку комментария"
+        )
+    else:
+        await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
+
+
+@bot1_dp.message(Command("cancel"))
+async def bot1_cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    bot1_pending.pop(message.from_user.id, None)
+    await message.answer("❌ Отправка отменена.")
+
+
+# ── Общая функция отправки анонимного комментария (любой тип) ──
+async def send_anon_comment(message: Message, state: FSMContext, content_type: str,
+                            file_id: str = None, caption_text: str = ""):
+    user_id = message.from_user.id
+    data = bot1_pending.get(user_id)
+
+    if not data:
+        await state.clear()
+        await message.answer("Ошибка. Нажми кнопку под постом снова.")
+        return
+
+    post_id, reply_to_msg_id = data
+    pseudo = bot1_get_pseudo(user_id, post_id)
+
+    # Базовый псевдоним
+    pseudo_block = f"<blockquote>{pseudo}</blockquote>"
+    if caption_text:
+        full_caption = f"{pseudo_block}\n{caption_text}"
+    else:
+        full_caption = pseudo_block
+
+    try:
+        sent = None  # основное сообщение, на которое будут отвечать
+        sent_media = None  # медиа без caption
+
+        # Текст
+        if content_type == "text":
+            sent = await bot1.send_message(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                text=full_caption,
+                parse_mode="HTML",
+                reply_to_message_id=reply_to_msg_id
+            )
+        # Медиа с поддержкой caption
+        elif content_type in ("photo", "video", "animation", "document"):
+            method_map = {
+                "photo": bot1.send_photo,
+                "video": bot1.send_video,
+                "animation": bot1.send_animation,
+                "document": bot1.send_document,
+            }
+            kwargs = {
+                "chat_id": BOT1_DISCUSSION_CHAT_ID,
+                content_type: file_id,
+                "caption": full_caption,
+                "parse_mode": "HTML",
+                "reply_to_message_id": reply_to_msg_id,
+            }
+            sent = await method_map[content_type](**kwargs)
+
+        # Стикер
+        elif content_type == "sticker":
+            sent_media = await bot1.send_sticker(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                sticker=file_id,
+                reply_to_message_id=reply_to_msg_id
+            )
+            # Псевдоним отдельным сообщением с привязкой к стикеру
+            sent = await bot1.send_message(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                text=full_caption,
+                parse_mode="HTML",
+                reply_to_message_id=sent_media.message_id
+            )
+        # Аудио / голосовое
+        elif content_type in ("audio", "voice"):
+            send_func = bot1.send_audio if content_type == "audio" else bot1.send_voice
+            sent_media = await send_func(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                **{content_type: file_id},
+                reply_to_message_id=reply_to_msg_id
+            )
+            # Псевдоним отдельным сообщением с привязкой к аудио
+            sent = await bot1.send_message(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                text=full_caption,
+                parse_mode="HTML",
+                reply_to_message_id=sent_media.message_id
+            )
+        else:
+            await message.answer("Неподдерживаемый тип сообщения.")
+            return
+
+        # Запоминаем связи для возможности ответа
+        if sent_media:
+            bot1_anon_msg_to_user[sent_media.message_id] = user_id
+            bot1_anon_msg_to_post[sent_media.message_id] = post_id
+        if sent:
+            bot1_anon_msg_to_user[sent.message_id] = user_id
+            bot1_anon_msg_to_post[sent.message_id] = post_id
+
+        await state.clear()
+        bot1_pending.pop(user_id, None)
+        await message.answer(
+            f"✅ Комментарий успешно опубликован!\n\n"
+            f"<b>Ваш псевдоним:</b> {pseudo}\n"
+            f"<i>Псевдоним генерируется каждый раз, когда вы комментируете новый пост.</i>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"[Bot1] Ошибка публикации: {e}")
+        await state.clear()
+        bot1_pending.pop(user_id, None)
+        await message.answer("Произошла ошибка. Попробуй позже.")
+
+
+# ── Хендлеры для разных типов контента в состоянии ожидания ──
+
+@bot1_dp.message(AnonState.waiting_text, F.text)
+async def handle_text(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "text", caption_text=message.text)
+
+@bot1_dp.message(AnonState.waiting_text, F.photo)
+async def handle_photo(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "photo",
+                            file_id=message.photo[-1].file_id,
+                            caption_text=message.caption or "")
+
+@bot1_dp.message(AnonState.waiting_text, F.video)
+async def handle_video(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "video",
+                            file_id=message.video.file_id,
+                            caption_text=message.caption or "")
+
+@bot1_dp.message(AnonState.waiting_text, F.animation)
+async def handle_animation(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "animation",
+                            file_id=message.animation.file_id,
+                            caption_text=message.caption or "")
+
+@bot1_dp.message(AnonState.waiting_text, F.audio)
+async def handle_audio(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "audio",
+                            file_id=message.audio.file_id,
+                            caption_text=message.caption or "")
+
+@bot1_dp.message(AnonState.waiting_text, F.voice)
+async def handle_voice(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "voice",
+                            file_id=message.voice.file_id,
+                            caption_text=message.caption or "")
+
+@bot1_dp.message(AnonState.waiting_text, F.document)
+async def handle_document(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "document",
+                            file_id=message.document.file_id,
+                            caption_text=message.caption or "")
+
+@bot1_dp.message(AnonState.waiting_text, F.sticker)
+async def handle_sticker(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "sticker",
+                            file_id=message.sticker.file_id)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# БОТ 2: АНОНИМНЫЕ СООБЩЕНИЯ В КАНАЛ + АДМИНКА
+# ═══════════════════════════════════════════════════════════════════
+
 # ── ВЕБ-СЕРВЕР (keep-alive) ───────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-    def log_message(self, *a): pass
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
 
 threading.Thread(
     target=lambda: HTTPServer(("0.0.0.0", 10000), Handler).serve_forever(),
@@ -84,8 +413,10 @@ threading.Thread(
 
 def _self_ping():
     while True:
-        try: urllib.request.urlopen("https://sausha-bot.onrender.com")
-        except: pass
+        try:
+            urllib.request.urlopen("https://sausha-bot.onrender.com")
+        except:
+            pass
         time.sleep(600)
 
 threading.Thread(target=_self_ping, daemon=True).start()
@@ -107,48 +438,70 @@ CONTENT_CHECK_PROMPT = """
 Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
 """.strip()
 
-IMAGE_CHECK_PROMPT = """
-Ты — строгий модератор изображений. Посмотри на изображение и определи есть ли там:
-- Обнажённая грудь, ягодицы, гениталии — БЛОКИРОВАТЬ
-- Порнография или сексуальный контент любой степени — БЛОКИРОВАТЬ
-- Нижнее бельё в сексуальном контексте — БЛОКИРОВАТЬ
-- Жестокое насилие, кровь, gore — БЛОКИРОВАТЬ
-Допустимо: купальники на пляже, поцелуи, обычные фото людей.
-Отвечай ТОЛЬКО JSON без пояснений: {"acceptable": true/false, "reason": "причина если false"}.
-""".strip()
+# ── ФАЙЛЫ И ДАННЫЕ ────────────────────────
+LOG_FILE = "anon_logs.json"
+START_LOG_FILE = "start_logs.json"
+MANUAL_IDS_FILE = "manual_ids.json"
+TOP_FILE = "top_data.json"
+ANON_MSGS_LOG_FILE = "anon_messages_log.json"  # Логи анонимных сообщений для админки
 
-VIDEO_CHECK_PROMPT = """
-Ты — строгий модератор. Посмотри на этот кадр из видео и определи есть ли там:
-- Обнажённая грудь, ягодицы, гениталии — БЛОКИРОВАТЬ
-- Порнография или сексуальный контент любой степени — БЛОКИРОВАТЬ
-- Нижнее бельё в сексуальном контексте — БЛОКИРОВАТЬ
-- Жестокое насилие, кровь, gore — БЛОКИРОВАТЬ
-Допустимо: купальники на пляже, поцелуи, обычные видео.
-Отвечай ТОЛЬКО JSON без пояснений: {"acceptable": true/false, "reason": "причина если false"}.
-""".strip()
+COOLDOWN_SECONDS = 180
+ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
+TYPING_DELAY = 0.015
+UPDATE_INTERVAL = 5
+GROQ_SEMAPHORE = asyncio.Semaphore(5)
+
+user_last_time: dict[int, datetime] = {}
+user_ai_context: dict[int, list[dict]] = {}
+message_logs: list[dict] = []
+start_logs: list[dict] = []
+manual_ids: list[int] = []
+top_data: dict = {}
+se_checks_month: dict = {}
+anon_messages_log: list[dict] = []  # Логи анонимных сообщений для админки
+
+# ── SIGHTENGINE ───────────────────────────
+def se_increment(n: int = 1):
+    key = datetime.now().strftime("%Y-%m")
+    se_checks_month[key] = se_checks_month.get(key, 0) + n
+
+def se_used() -> int:
+    key = datetime.now().strftime("%Y-%m")
+    return se_checks_month.get(key, 0)
+
+def se_left() -> int:
+    return max(0, SE_MONTH_LIMIT - se_used())
 
 # ── УТИЛИТЫ ───────────────────────────────
 _MDV2 = re.compile(r'([_*\[\]()~`>#+=|{}.!\\-])')
+
 def escape_mdv2(t: str) -> str:
     return _MDV2.sub(r"\\\1", t)
 
 def _load_json(path):
-    if not os.path.exists(path): return []
+    if not os.path.exists(path):
+        return []
     try:
-        with open(path, encoding="utf-8") as f: return json.load(f)
-    except: return []
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return []
 
 def _load_json_dict(path):
-    if not os.path.exists(path): return {}
+    if not os.path.exists(path):
+        return {}
     try:
-        with open(path, encoding="utf-8") as f: return json.load(f)
-    except: return {}
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
 
 def _save_json(path, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e: logger.error("Ошибка записи %s: %s", path, e)
+    except Exception as e:
+        logger.error("Ошибка записи %s: %s", path, e)
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────
 def current_week_key() -> str:
@@ -158,38 +511,48 @@ def current_week_key() -> str:
 def load_manual_ids() -> list[int]:
     if not os.path.exists(MANUAL_IDS_FILE):
         default_ids = [
-            1065994703,1317499381,1325803980,1348135622,1445013145,
-            1596705847,1598141304,1658111818,1793536849,1812163694,
-            5012402904,5058039623,5093484454,5222651755,5244622001,
-            5398185223,5591478632,5846879986,5886556924,5900068784,
-            5960908435,6171031779,6322668072,6398253412,6575282623,
-            6647049769,6677665897,6716660326,6762818617,6811352382,
-            6815122910,6860269336,6927328893,7089300064,7112529527,
-            7194633128,7234303233,7431729389,7447312123,7476200435,
-            7691946899,7810494142,7824611507,7854035216,7927447701,
-            7948610168,7971084218,8013816191,8118408450,8150421121,
-            8160648800,8223293549,8306392029,8314930012,8323205303,
-            8340087744,8366862190,8475400754,8484636623,8534170879,
-            8555817128,8627543263,8665408669,8711321595,
+            1065994703, 1317499381, 1325803980, 1348135622, 1445013145,
+            1596705847, 1598141304, 1658111818, 1793536849, 1812163694,
+            5012402904, 5058039623, 5093484454, 5222651755, 5244622001,
+            5398185223, 5591478632, 5846879986, 5886556924, 5900068784,
+            5960908435, 6171031779, 6322668072, 6398253412, 6575282623,
+            6647049769, 6677665897, 6716660326, 6762818617, 6811352382,
+            6815122910, 6860269336, 6927328893, 7089300064, 7112529527,
+            7194633128, 7234303233, 7431729389, 7447312123, 7476200435,
+            7691946899, 7810494142, 7824611507, 7854035216, 7927447701,
+            7948610168, 7971084218, 8013816191, 8118408450, 8150421121,
+            8160648800, 8223293549, 8306392029, 8314930012, 8323205303,
+            8340087744, 8366862190, 8475400754, 8484636623, 8534170879,
+            8555817128, 8627543263, 8665408669, 8711321595,
         ]
         _save_json(MANUAL_IDS_FILE, default_ids)
         return default_ids
-    try: return [int(x) for x in _load_json(MANUAL_IDS_FILE)]
-    except: return []
+    try:
+        return [int(x) for x in _load_json(MANUAL_IDS_FILE)]
+    except:
+        return []
 
-def save_manual_ids(ids): _save_json(MANUAL_IDS_FILE, ids)
+def save_manual_ids(ids):
+    _save_json(MANUAL_IDS_FILE, ids)
 
 def load_all_logs():
-    global message_logs, start_logs, manual_ids, top_data
+    global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log
     message_logs = _load_json(LOG_FILE)
-    start_logs   = _load_json(START_LOG_FILE)
-    manual_ids   = load_manual_ids()
-    raw          = _load_json(TOP_FILE)
-    top_data     = raw if isinstance(raw, dict) else {}
+    start_logs = _load_json(START_LOG_FILE)
+    manual_ids = load_manual_ids()
+    raw = _load_json(TOP_FILE)
+    top_data = raw if isinstance(raw, dict) else {}
+    se_checks_month = _load_json_dict("se_checks.json")
+    anon_messages_log = _load_json(ANON_MSGS_LOG_FILE)
 
 def add_message_log(entry):
     message_logs.append(entry)
     _save_json(LOG_FILE, message_logs)
+
+def add_anon_message_log(entry):
+    """Лог анонимных сообщений для просмотра в админке"""
+    anon_messages_log.append(entry)
+    _save_json(ANON_MSGS_LOG_FILE, anon_messages_log)
 
 def add_start_log(uid, uname, fn, ln):
     start_logs.append({
@@ -201,7 +564,7 @@ def add_start_log(uid, uname, fn, ln):
 # ── ТОП ───────────────────────────────────
 def get_top_entries() -> list[dict]:
     week = current_week_key()
-    res = [{"user_id": int(k), "nick": v.get("nick","Аноним"), "count": v.get("count",0)}
+    res = [{"user_id": int(k), "nick": v.get("nick", "Аноним"), "count": v.get("count", 0)}
            for k, v in top_data.items() if v.get("week") == week]
     return sorted(res, key=lambda x: x["count"], reverse=True)
 
@@ -213,12 +576,12 @@ def increment_top(uid: int):
     e = top_data[k]
     if e.get("week") != week:
         e["count"] = 0
-        e["week"]  = week
+        e["week"] = week
     e["count"] = e.get("count", 0) + 1
     _save_json(TOP_FILE, top_data)
 
 def join_top(uid: int, nick: str):
-    k    = str(uid)
+    k = str(uid)
     week = current_week_key()
     if k in top_data:
         if top_data[k].get("week") == week:
@@ -241,7 +604,8 @@ def _count_user_anons_this_week(uid: int) -> int:
         try:
             if datetime.fromisoformat(entry["timestamp"]) >= week_start:
                 count += 1
-        except: pass
+        except:
+            pass
     return count
 
 def leave_top(uid: int):
@@ -256,13 +620,13 @@ def is_in_top(uid: int) -> bool:
 
 def build_top_text() -> str:
     entries = get_top_entries()
-    today   = datetime.now()
+    today = datetime.now()
     days_until_monday = (7 - today.weekday()) % 7 or 7
-    reset   = (today + timedelta(days=days_until_monday)).strftime("%d.%m")
-    week    = current_week_key()
-    MEDALS  = ["🥇","🥈","🥉"]
-    PLACES  = ["4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
-    lines   = [
+    reset = (today + timedelta(days=days_until_monday)).strftime("%d.%m")
+    week = current_week_key()
+    MEDALS = ["🥇", "🥈", "🥉"]
+    PLACES = ["4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    lines = [
         "🏆 ТОП АНОНИМЩИКОВ НЕДЕЛИ",
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
         f"📅 Неделя: {week}",
@@ -270,14 +634,14 @@ def build_top_text() -> str:
         "",
     ]
     if not entries:
-        lines += ["😶 Пока никого нет в рейтинге","","💡 Нажми «Вступить в топ» чтобы","   участвовать в соревновании!"]
+        lines += ["😶 Пока никого нет в рейтинге", "", "💡 Нажми «Вступить в топ» чтобы", "   участвовать в соревновании!"]
     else:
         max_count = max(e["count"] for e in entries) or 1
         for i, e in enumerate(entries[:10]):
-            medal  = MEDALS[i] if i < 3 else PLACES[i-3] if i < 10 else f"{i+1}."
+            medal = MEDALS[i] if i < 3 else PLACES[i - 3] if i < 10 else f"{i + 1}."
             filled = round(e["count"] / max_count * 8)
-            bar    = "█" * filled + "░" * (8 - filled)
-            nick   = e["nick"][:20]
+            bar = "█" * filled + "░" * (8 - filled)
+            nick = e["nick"][:20]
             lines.append(f"{medal}  {nick}")
             lines.append(f"    ▏{bar}▏  {e['count']} анонимок")
             lines.append("")
@@ -295,84 +659,68 @@ async def _groq_request(payload, retries=2):
                     headers=headers, json=payload
                 )
                 if r.status_code == 429 and attempt < retries:
-                    await asyncio.sleep(2 ** attempt); continue
+                    await asyncio.sleep(2 ** attempt)
+                    continue
                 return r.json() if r.status_code == 200 else None
             except httpx.TimeoutException:
-                if attempt < retries: await asyncio.sleep(1)
+                if attempt < retries:
+                    await asyncio.sleep(1)
             except Exception as e:
                 logger.error("Groq: %s", e)
-                if attempt < retries: await asyncio.sleep(1)
+                if attempt < retries:
+                    await asyncio.sleep(1)
     return None
 
 async def call_groq_simple(prompt, system, as_json=False):
     payload = {
         "model": "llama-3.1-8b-instant",
-        "messages": [{"role":"system","content":system},{"role":"user","content":prompt}],
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         "temperature": 0.1 if as_json else 0.9,
         "max_tokens": 256,
     }
-    if as_json: payload["response_format"] = {"type":"json_object"}
+    if as_json:
+        payload["response_format"] = {"type": "json_object"}
     try:
         d = await _groq_request(payload)
         return d["choices"][0]["message"]["content"] if d else None
-    except Exception as e: logger.error("Groq simple: %s", e); return None
-
-async def call_groq_vision(image_b64: str, prompt: str) -> str | None:
-    """Анализ изображения через Groq Vision (llama-4-scout)"""
-    payload = {
-        "model": "meta-llama/llama-4-maverick-17b-128e-instruct",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
-                },
-                {"type": "text", "text": prompt}
-            ]
-        }],
-        "temperature": 0.1,
-        "max_tokens": 256,
-        "response_format": {"type": "json_object"}
-    }
-    try:
-        d = await _groq_request(payload, retries=2)
-        return d["choices"][0]["message"]["content"] if d else None
     except Exception as e:
-        logger.error("Groq vision: %s", e)
+        logger.error("Groq simple: %s", e)
         return None
 
 async def call_groq_with_context(uid: int, user_msg: str) -> str:
     async with GROQ_SEMAPHORE:
         history = user_ai_context.setdefault(uid, [])
-        msgs = [{"role":"system","content":SYSTEM_PROMPT}, *history,
-                {"role":"user","content":user_msg}]
+        msgs = [{"role": "system", "content": SYSTEM_PROMPT}, *history,
+                {"role": "user", "content": user_msg}]
         try:
-            d = await _groq_request({"model":"llama-3.1-8b-instant","messages":msgs,
-                                     "temperature":0.9,"max_tokens":1024}, retries=2)
-            if not d: return "⚠️ ИИ временно недоступен, попробуй позже."
+            d = await _groq_request({
+                "model": "llama-3.1-8b-instant",
+                "messages": msgs,
+                "temperature": 0.9,
+                "max_tokens": 1024
+            }, retries=2)
+            if not d:
+                return "⚠️ ИИ временно недоступен, попробуй позже."
             reply = d["choices"][0]["message"]["content"]
-            history += [{"role":"user","content":user_msg},{"role":"assistant","content":reply}]
-            if len(history) > 6: user_ai_context[uid] = history[-6:]
+            history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
+            if len(history) > 6:
+                user_ai_context[uid] = history[-6:]
             return reply
         except Exception as e:
             logger.error("Groq ctx: %s", e)
             return "⚠️ Ошибка сети."
 
-# ── СКАЧИВАНИЕ ФАЙЛА ──────────────────────
 # ── SIGHTENGINE МОДЕРАЦИЯ ─────────────────
 async def _get_tg_file_url(bot, file_id: str) -> str | None:
-    """Получает прямую ссылку на файл в Telegram"""
     try:
         tg_file = await bot.get_file(file_id)
         return tg_file.file_path if tg_file.file_path.startswith("http") else \
-               f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+               f"https://api.telegram.org/file/bot{BOT2_TOKEN}/{tg_file.file_path}"
     except Exception as e:
         logger.error("Ошибка получения URL файла: %s", e)
         return None
 
 async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
-    """Проверяет байты изображения через Sightengine"""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -399,16 +747,15 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
         logger.info("Sightengine: sexual=%.2f offensive=%.2f", sexual_score, offensive)
         se_increment(1)
         if sexual_score > 0.5:
-            return False, f"сексуальный контент ({int(sexual_score*100)}%)"
+            return False, f"сексуальный контент ({int(sexual_score * 100)}%)"
         if offensive > 0.7:
-            return False, f"оскорбительный контент ({int(offensive*100)}%)"
+            return False, f"оскорбительный контент ({int(offensive * 100)}%)"
         return True, ""
     except Exception as e:
         logger.error("Sightengine bytes check error: %s", e)
         return True, ""
 
 async def _convert_to_jpg_bytes(input_bytes: bytes, suffix: str) -> bytes | None:
-    """Конвертирует любой файл в jpg через ffmpeg"""
     input_path = None
     output_path = None
     try:
@@ -433,23 +780,21 @@ async def _convert_to_jpg_bytes(input_bytes: bytes, suffix: str) -> bytes | None
     finally:
         for p in [input_path, output_path]:
             if p and os.path.exists(p):
-                try: os.unlink(p)
-                except: pass
+                try:
+                    os.unlink(p)
+                except:
+                    pass
 
 async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
-    """Проверка стикера — статичный/анимированный/видео"""
     try:
         tg_file = await bot.get_file(sticker.file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
 
         if sticker.is_animated:
-            # .tgs — Lottie анимация, конвертируем через ffmpeg
             jpg = await _convert_to_jpg_bytes(file_bytes, ".tgs")
         elif sticker.is_video:
-            # .webm видео-стикер
             jpg = await _convert_to_jpg_bytes(file_bytes, ".webm")
         else:
-            # .webp статичный — конвертируем в jpg
             jpg = await _convert_to_jpg_bytes(file_bytes, ".webp")
 
         if not jpg:
@@ -462,7 +807,6 @@ async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
         return True, ""
 
 async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
-    """Проверка изображения через Sightengine"""
     try:
         url = await _get_tg_file_url(bot, file_id)
         if not url:
@@ -492,16 +836,15 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
         logger.info("Sightengine фото: sexual=%.2f offensive=%.2f", sexual_score, offensive)
         se_increment(1)
         if sexual_score > 0.5:
-            return False, f"сексуальный контент (уверенность {int(sexual_score*100)}%)"
+            return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
         if offensive > 0.7:
-            return False, f"оскорбительный контент (уверенность {int(offensive*100)}%)"
+            return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
         return True, ""
     except Exception as e:
         logger.error("Ошибка проверки изображения Sightengine: %s", e)
         return True, ""
 
 async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
-    """Проверка видео — извлекаем 7 кадров ffmpeg и проверяем каждый через Sightengine"""
     video_path = None
     try:
         tg_file = await bot.get_file(file_id)
@@ -530,7 +873,6 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
             if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
                 continue
 
-            # Проверяем кадр через Sightengine (загружаем файл напрямую)
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     with open(frame_path, "rb") as f:
@@ -556,9 +898,9 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                     logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
                     se_increment(1)
                     if sexual_score > 0.5:
-                        return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score*100)}%)"
+                        return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score * 100)}%)"
                     if offensive > 0.7:
-                        return False, f"оскорбительный контент на {sec}-й секунде ({int(offensive*100)}%)"
+                        return False, f"оскорбительный контент на {sec}-й секунде ({int(offensive * 100)}%)"
             except Exception as e:
                 logger.error("Ошибка Sightengine кадр %d: %s", sec, e)
             finally:
@@ -575,57 +917,63 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
 
 # ── МОДЕРАЦИЯ ТЕКСТА ──────────────────────
 async def is_content_acceptable(text: str) -> tuple[bool, str]:
-    if not text or len(text.strip()) < 2: return False, "слишком короткое"
+    if not text or len(text.strip()) < 2:
+        return False, "слишком короткое"
     res = await call_groq_simple(text, CONTENT_CHECK_PROMPT, as_json=True)
-    if not res: return True, ""
+    if not res:
+        return True, ""
     try:
-        p  = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
+        p = json.loads(res.strip().removeprefix("```json").removesuffix("```").strip())
         ok = bool(p.get("acceptable", True))
-        return ok, ("" if ok else p.get("reason",""))
-    except: return True, ""
+        return ok, ("" if ok else p.get("reason", ""))
+    except:
+        return True, ""
 
 # ── АНИМАЦИЯ ПЕЧАТАНИЯ ────────────────────
 async def typewriter_reply(update: Update, full_text: str):
-    if not full_text: return
-    msg       = await update.message.reply_text("▌")
+    if not full_text:
+        return
+    msg = await update.message.reply_text("▌")
     displayed = ""
     for i, ch in enumerate(full_text, 1):
         displayed += ch
         if i % UPDATE_INTERVAL == 0 or i == len(full_text):
             cursor = "" if i == len(full_text) else "▌"
-            try: await msg.edit_text(displayed + cursor)
-            except: pass
+            try:
+                await msg.edit_text(displayed + cursor)
+            except:
+                pass
         await asyncio.sleep(TYPING_DELAY)
 
 # ── ОТПРАВКА В КАНАЛ ──────────────────────
 async def send_to_channel(context, update, text) -> int | None:
-    header  = "*📩 Анонимное сообщение*"
-    safe    = escape_mdv2(text) if text else ""
-    footer  = ">  [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
+    header = "*📩 Анонимное сообщение*"
+    safe = escape_mdv2(text) if text else ""
+    footer = ">  [✉️ Отправить анонимку](https://t.me/Shkola6_anonchik_bot)"
     caption = f"{header}\n\n{safe}" if safe else header
-    full    = f"{caption}\n\n{footer}"
+    full = f"{caption}\n\n{footer}"
 
     msg = update.message
     bot = context.bot
     try:
         s = None
         if msg.photo:
-            s = await bot.send_photo(CHANNEL_ID, msg.photo[-1].file_id, caption=full, parse_mode="MarkdownV2")
+            s = await bot.send_photo(BOT2_CHANNEL_ID, msg.photo[-1].file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.video:
-            s = await bot.send_video(CHANNEL_ID, msg.video.file_id, caption=full, parse_mode="MarkdownV2")
+            s = await bot.send_video(BOT2_CHANNEL_ID, msg.video.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.animation:
-            s = await bot.send_animation(CHANNEL_ID, msg.animation.file_id, caption=full, parse_mode="MarkdownV2")
+            s = await bot.send_animation(BOT2_CHANNEL_ID, msg.animation.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.audio:
-            s = await bot.send_audio(CHANNEL_ID, msg.audio.file_id, caption=full, parse_mode="MarkdownV2")
+            s = await bot.send_audio(BOT2_CHANNEL_ID, msg.audio.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.voice:
-            s = await bot.send_voice(CHANNEL_ID, msg.voice.file_id, caption=full, parse_mode="MarkdownV2")
+            s = await bot.send_voice(BOT2_CHANNEL_ID, msg.voice.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.document:
-            s = await bot.send_document(CHANNEL_ID, msg.document.file_id, caption=full, parse_mode="MarkdownV2")
+            s = await bot.send_document(BOT2_CHANNEL_ID, msg.document.file_id, caption=full, parse_mode="MarkdownV2")
         elif msg.sticker:
-            s = await bot.send_sticker(CHANNEL_ID, msg.sticker.file_id)
-            await bot.send_message(CHANNEL_ID, footer, parse_mode="MarkdownV2")
+            s = await bot.send_sticker(BOT2_CHANNEL_ID, msg.sticker.file_id)
+            await bot.send_message(BOT2_CHANNEL_ID, footer, parse_mode="MarkdownV2")
         elif msg.text:
-            s = await bot.send_message(CHANNEL_ID, full, parse_mode="MarkdownV2")
+            s = await bot.send_message(BOT2_CHANNEL_ID, full, parse_mode="MarkdownV2")
         else:
             return None
         return s.message_id if s else None
@@ -635,12 +983,12 @@ async def send_to_channel(context, update, text) -> int | None:
 
 # ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
 async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None):
-    u    = update.effective_user
+    u = update.effective_user
     ustr = f"@{u.username}" if u.username else "—"
     name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "—"
-    safe_ustr = ustr.replace("_","\_").replace("*","\*").replace("`","\`")
-    safe_name = name.replace("_","\_").replace("*","\*").replace("`","\`")
-    ico  = "🚫" if blocked_reason else "🕵️"
+    safe_ustr = ustr.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    safe_name = name.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    ico = "🚫" if blocked_reason else "🕵️"
     lines = [
         f"{ico} *{'ЗАБЛОКИРОВАНО' if blocked_reason else 'Новая анонимка'}*",
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
@@ -659,7 +1007,6 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
     msg = update.message
     bot = context.bot
     try:
-        # Если заблокировано — шлём само медиа админу
         if blocked_reason:
             if msg.photo:
                 await bot.send_photo(ADMIN_ID, msg.photo[-1].file_id, caption=caption, parse_mode="Markdown")
@@ -679,43 +1026,43 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
 
 # ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✉️  Отправить анонимку", callback_data="menu_anon")],
-        [InlineKeyboardButton("🏆  Топ анонимщиков",    callback_data="menu_top")],
-        [InlineKeyboardButton("🤖  Поболтать с ИИ",     callback_data="menu_ai")],
-        [InlineKeyboardButton("❓  Помощь",              callback_data="menu_help")],
+    return PTBInlineKeyboardMarkup([
+        [PTBInlineKeyboardButton("✉️  Отправить анонимку", callback_data="menu_anon")],
+        [PTBInlineKeyboardButton("🏆  Топ анонимщиков", callback_data="menu_top")],
+        [PTBInlineKeyboardButton("🤖  Поболтать с ИИ", callback_data="menu_ai")],
+        [PTBInlineKeyboardButton("❓  Помощь", callback_data="menu_help")],
     ])
 
 def top_keyboard(uid):
     rows = []
     if is_in_top(uid):
         rows.append([
-            InlineKeyboardButton("✏️  Сменить ник",  callback_data="top_join"),
-            InlineKeyboardButton("🚪  Покинуть топ", callback_data="top_leave"),
+            PTBInlineKeyboardButton("✏️  Сменить ник", callback_data="top_join"),
+            PTBInlineKeyboardButton("🚪  Покинуть топ", callback_data="top_leave"),
         ])
     else:
-        rows.append([InlineKeyboardButton("🏅  Вступить в топ", callback_data="top_join")])
+        rows.append([PTBInlineKeyboardButton("🏅  Вступить в топ", callback_data="top_join")])
     rows.append([
-        InlineKeyboardButton("🔄  Обновить", callback_data="top_refresh"),
-        InlineKeyboardButton("🔙  Назад",    callback_data="menu_back"),
+        PTBInlineKeyboardButton("🔄  Обновить", callback_data="top_refresh"),
+        PTBInlineKeyboardButton("🔙  Назад", callback_data="menu_back"),
     ])
-    return InlineKeyboardMarkup(rows)
+    return PTBInlineKeyboardMarkup(rows)
 
 def ai_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧠  Сбросить память", callback_data="ai_reset"),
-         InlineKeyboardButton("🔙  Назад",           callback_data="menu_back")],
+    return PTBInlineKeyboardMarkup([
+        [PTBInlineKeyboardButton("🧠  Сбросить память", callback_data="ai_reset"),
+         PTBInlineKeyboardButton("🔙  Назад", callback_data="menu_back")],
     ])
 
 def after_anon_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄  Отправить ещё", callback_data="anon_again"),
-         InlineKeyboardButton("🏆  Мой топ",       callback_data="menu_top")],
-        [InlineKeyboardButton("🏠  Главное меню",  callback_data="menu_back")],
+    return PTBInlineKeyboardMarkup([
+        [PTBInlineKeyboardButton("🔄  Отправить ещё", callback_data="anon_again"),
+         PTBInlineKeyboardButton("🏆  Мой топ", callback_data="menu_top")],
+        [PTBInlineKeyboardButton("🏠  Главное меню", callback_data="menu_back")],
     ])
 
 def back_keyboard(cb="menu_back"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙  Назад", callback_data=cb)]])
+    return PTBInlineKeyboardMarkup([[PTBInlineKeyboardButton("🔙  Назад", callback_data=cb)]])
 
 # ── ГЛАВНОЕ МЕНЮ ──────────────────────────
 MENU_TEXT = (
@@ -725,7 +1072,7 @@ MENU_TEXT = (
     "Выбери действие 👇"
 )
 
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+async def main_menu(update: Update, context: PTBContextTypes.DEFAULT_TYPE, edit=False):
     kb = main_keyboard()
     if edit and update.callback_query:
         try:
@@ -735,8 +1082,8 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
     else:
         await update.message.reply_text(MENU_TEXT, reply_markup=kb)
 
-# ── КОМАНДЫ ───────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── КОМАНДЫ БОТА 2 ────────────────────────
+async def bot2_cmd_start(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     add_start_log(u.id, u.username, u.first_name, u.last_name)
     context.user_data.clear()
@@ -751,8 +1098,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(),
     )
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+async def bot2_cmd_cancel(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
     popped = (context.user_data.pop("awaiting_broadcast", None)
               or context.user_data.pop("awaiting_ids", None)
               or context.user_data.pop("awaiting_test_media", None))
@@ -760,16 +1108,17 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── АДМИН-ПАНЕЛЬ ──────────────────────────
 def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📩  Анонимки",     callback_data="admin_tab_messages"),
-         InlineKeyboardButton("👥  Пользователи", callback_data="admin_tab_starts")],
-        [InlineKeyboardButton("🏆  Топ",          callback_data="admin_view_top"),
-         InlineKeyboardButton("📣  Рассылка",     callback_data="admin_broadcast")],
-        [InlineKeyboardButton("➕  Добавить ID",  callback_data="admin_add_ids"),
-         InlineKeyboardButton("📋  Список ID",    callback_data="admin_list_ids")],
-        [InlineKeyboardButton("📤  Экспорт CSV",  callback_data="admin_export"),
-         InlineKeyboardButton("🧹  Удалить >7д",  callback_data="admin_clean_old")],
-        [InlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
+    return PTBInlineKeyboardMarkup([
+        [PTBInlineKeyboardButton("📩  Анонимки", callback_data="admin_tab_messages"),
+         PTBInlineKeyboardButton("👥  Пользователи", callback_data="admin_tab_starts")],
+        [PTBInlineKeyboardButton("🏆  Топ", callback_data="admin_view_top"),
+         PTBInlineKeyboardButton("📣  Рассылка", callback_data="admin_broadcast")],
+        [PTBInlineKeyboardButton("➕  Добавить ID", callback_data="admin_add_ids"),
+         PTBInlineKeyboardButton("📋  Список ID", callback_data="admin_list_ids")],
+        [PTBInlineKeyboardButton("📤  Экспорт CSV", callback_data="admin_export"),
+         PTBInlineKeyboardButton("🧹  Удалить >7д", callback_data="admin_clean_old")],
+        [PTBInlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
+        [PTBInlineKeyboardButton("📨  Логи анонимных сообщений", callback_data="admin_anon_msgs")],
     ])
 
 def admin_text():
@@ -786,15 +1135,15 @@ def admin_text():
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔"
     )
 
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bot2_cmd_admin(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔️ Доступ запрещён.")
         return
     await update.message.reply_text(admin_text(), reply_markup=admin_keyboard())
 
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data  = query.data
+    data = query.data
     if update.effective_user.id != ADMIN_ID:
         await query.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
@@ -820,13 +1169,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_view_top":
         entries = get_top_entries()
-        M = ["🥇","🥈","🥉"]
+        M = ["🥇", "🥈", "🥉"]
         lines = ["🏆 *Топ анонимщиков*\n"]
         if not entries:
             lines.append("Пока пусто 😶")
         else:
             for i, e in enumerate(entries[:10]):
-                m = M[i] if i < 3 else f"{i+1}\\."
+                m = M[i] if i < 3 else f"{i + 1}\\."
                 lines.append(f"{m} *{e['nick']}* — {e['count']} анонимок\n`ID: {e['user_id']}`")
         await query.edit_message_text(
             "\n".join(lines), parse_mode="Markdown",
@@ -855,14 +1204,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=back_keyboard("admin_back"))
 
+    elif data == "admin_anon_msgs":
+        await show_anon_messages_page(query, 0)
+
     elif data == "admin_back":
         await query.edit_message_text(admin_text(), reply_markup=admin_keyboard())
 
     elif data.startswith("msg_page_"):
-        await show_message_logs_page(query, int(data.rsplit("_",1)[-1]))
+        await show_message_logs_page(query, int(data.rsplit("_", 1)[-1]))
 
     elif data.startswith("start_page_"):
-        await show_start_logs_page(query, int(data.rsplit("_",1)[-1]))
+        await show_start_logs_page(query, int(data.rsplit("_", 1)[-1]))
+
+    elif data.startswith("anon_msg_page_"):
+        await show_anon_messages_page(query, int(data.rsplit("_", 1)[-1]))
 
     elif data == "msg_clear":
         message_logs.clear()
@@ -874,11 +1229,16 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_json(START_LOG_FILE, start_logs)
         await query.edit_message_text("🧹 Логи стартов очищены.", reply_markup=admin_keyboard())
 
+    elif data == "anon_msg_clear":
+        anon_messages_log.clear()
+        _save_json(ANON_MSGS_LOG_FILE, anon_messages_log)
+        await query.edit_message_text("🧹 Логи анонимных сообщений очищены.", reply_markup=admin_keyboard())
+
     else:
         await query.answer("Неизвестная команда.", show_alert=True)
 
-# ── ОБРАБОТЧИК СООБЩЕНИЙ ──────────────────
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── ОБРАБОТЧИК СООБЩЕНИЙ БОТА 2 ──────────
+async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
 
@@ -949,7 +1309,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- добавление ID (админ) ---
     if context.user_data.get("awaiting_ids") and uid == ADMIN_ID:
-        text    = (update.message.text or "").strip()
+        text = (update.message.text or "").strip()
         new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
         if not new_ids:
             await update.message.reply_text("Не найдено числовых ID. Попробуй снова.")
@@ -998,28 +1358,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await main_menu(update, context)
 
-# ── АНОНИМКА ──────────────────────────────
-async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    msg  = update.message
+# ── АНОНИМКА БОТА 2 ───────────────────────
+async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    msg = update.message
     text = msg.text or msg.caption or ""
-    now  = datetime.now()
+    now = datetime.now()
 
     last = user_last_time.get(uid)
     if last and (now - last).total_seconds() < COOLDOWN_SECONDS:
-        rem  = int(COOLDOWN_SECONDS - (now - last).total_seconds())
+        rem = int(COOLDOWN_SECONDS - (now - last).total_seconds())
         m, s = divmod(rem, 60)
         await msg.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
         return
 
-    # Определяем тип контента
-    ctype = ("фото"      if msg.photo     else
-             "видео"     if msg.video     else
-             "GIF"       if msg.animation else
-             "аудио"     if msg.audio     else
-             "голосовое" if msg.voice     else
-             "документ"  if msg.document  else
-             "стикер"    if msg.sticker   else "текст")
+    ctype = ("фото" if msg.photo else
+             "видео" if msg.video else
+             "GIF" if msg.animation else
+             "аудио" if msg.audio else
+             "голосовое" if msg.voice else
+             "документ" if msg.document else
+             "стикер" if msg.sticker else "текст")
 
     # ── Модерация изображений ──
     if msg.photo:
@@ -1029,7 +1388,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_message_log({
                 "user_id": uid, "username": update.effective_user.username,
                 "first_name": update.effective_user.first_name,
-                "last_name":  update.effective_user.last_name,
+                "last_name": update.effective_user.last_name,
                 "content_type": ctype, "text": text,
                 "timestamp": now.isoformat(), "blocked": reason,
             })
@@ -1045,7 +1404,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_message_log({
                 "user_id": uid, "username": update.effective_user.username,
                 "first_name": update.effective_user.first_name,
-                "last_name":  update.effective_user.last_name,
+                "last_name": update.effective_user.last_name,
                 "content_type": ctype, "text": text,
                 "timestamp": now.isoformat(), "blocked": reason,
             })
@@ -1062,7 +1421,7 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_message_log({
                 "user_id": uid, "username": update.effective_user.username,
                 "first_name": update.effective_user.first_name,
-                "last_name":  update.effective_user.last_name,
+                "last_name": update.effective_user.last_name,
                 "content_type": ctype, "text": text,
                 "timestamp": now.isoformat(), "blocked": reason,
             })
@@ -1080,9 +1439,21 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_message_log({
         "user_id": uid, "username": update.effective_user.username,
         "first_name": update.effective_user.first_name,
-        "last_name":  update.effective_user.last_name,
+        "last_name": update.effective_user.last_name,
         "content_type": ctype, "text": text,
         "timestamp": now.isoformat(), "channel_msg_id": mid,
+    })
+
+    # ── Лог анонимного сообщения для админки ──
+    add_anon_message_log({
+        "user_id": uid,
+        "username": update.effective_user.username,
+        "first_name": update.effective_user.first_name,
+        "last_name": update.effective_user.last_name,
+        "content_type": ctype,
+        "text": text,
+        "timestamp": now.isoformat(),
+        "channel_msg_id": mid,
     })
 
     increment_top(uid)
@@ -1095,8 +1466,8 @@ async def handle_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=after_anon_keyboard())
 
-# ── ИИ-ЧАТ ───────────────────────────────
-async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── ИИ-ЧАТ БОТА 2 ────────────────────────
+async def handle_ai_chat(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     inp = update.message.text
     if not inp:
         await update.message.reply_text("В режиме ИИ принимается только текст.")
@@ -1105,16 +1476,16 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     res = await call_groq_with_context(update.effective_user.id, inp)
     await typewriter_reply(update, res or "⚠️ ИИ временно недоступен.")
 
-# ── КНОПКИ ────────────────────────────────
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ── КНОПКИ БОТА 2 ────────────────────────
+async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    uid  = update.effective_user.id
+    uid = update.effective_user.id
 
     if (data.startswith("admin_") or data.startswith("msg_page_")
-            or data.startswith("start_page_")
-            or data in ("msg_clear","start_clear")):
+            or data.startswith("start_page_") or data.startswith("anon_msg_page_")
+            or data in ("msg_clear", "start_clear", "anon_msg_clear")):
         await admin_callback(update, context)
         return
 
@@ -1134,7 +1505,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "top_refresh":
         try:
             await query.edit_message_text(build_top_text(), reply_markup=top_keyboard(uid))
-        except: pass
+        except:
+            pass
 
     elif data == "top_join":
         context.user_data["awaiting_top_nick"] = True
@@ -1196,22 +1568,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── ЛОГИ / ПАГИНАЦИЯ ─────────────────────
 def _paginate(items, page, per=5):
     total = max(1, (len(items) + per - 1) // per)
-    page  = max(0, min(page, total - 1))
-    return items[page*per:(page+1)*per], total
+    page = max(0, min(page, total - 1))
+    return items[page * per:(page + 1) * per], total
 
 def _nav(page, total, prefix, clear_cb, end=False):
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data=f"{prefix}{page-1}"))
+        nav.append(PTBInlineKeyboardButton("◀️", callback_data=f"{prefix}{page - 1}"))
     if page < total - 1:
-        nav.append(InlineKeyboardButton("▶️", callback_data=f"{prefix}{page+1}"))
+        nav.append(PTBInlineKeyboardButton("▶️", callback_data=f"{prefix}{page + 1}"))
     if end and total > 1 and page < total - 1:
-        nav.append(InlineKeyboardButton("⏭", callback_data=f"{prefix}{total-1}"))
+        nav.append(PTBInlineKeyboardButton("⏭", callback_data=f"{prefix}{total - 1}"))
     rows = []
-    if nav: rows.append(nav)
-    rows.append([InlineKeyboardButton("🗑  Очистить всё",   callback_data=clear_cb)])
-    rows.append([InlineKeyboardButton("🔙  Назад в панель", callback_data="admin_back")])
-    return InlineKeyboardMarkup(rows)
+    if nav:
+        rows.append(nav)
+    rows.append([PTBInlineKeyboardButton("🗑  Очистить всё", callback_data=clear_cb)])
+    rows.append([PTBInlineKeyboardButton("🔙  Назад в панель", callback_data="admin_back")])
+    return PTBInlineKeyboardMarkup(rows)
+
 
 async def show_message_logs_page(query, page):
     if not message_logs:
@@ -1220,27 +1594,27 @@ async def show_message_logs_page(query, page):
             reply_markup=_nav(0, 1, "msg_page_", "msg_clear"))
         return
     items, total = _paginate(message_logs, page)
-    lines = [f"📩 Анонимки — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
-    for i, e in enumerate(items, page*5+1):
-        dt    = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+    lines = [f"📩 Анонимки — стр. {page + 1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
+    for i, e in enumerate(items, page * 5 + 1):
+        dt = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
         uname = e.get("username") or ""
         fname = e.get("first_name") or ""
         lname = e.get("last_name") or ""
-        ustr  = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
-        snip  = (e.get("text") or "")[:60] or "—"
-        blk   = e.get("blocked")
-        ico   = "🚫" if blk else "✅"
-        mid   = e.get("channel_msg_id")
+        ustr = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        snip = (e.get("text") or "")[:60] or "—"
+        blk = e.get("blocked")
+        ico = "🚫" if blk else "✅"
+        mid = e.get("channel_msg_id")
         if mid and not blk:
-            ch   = str(CHANNEL_ID).replace("-100","")
+            ch = str(BOT2_CHANNEL_ID).replace("-100", "")
             link = f"[🔗 открыть](https://t.me/c/{ch}/{mid})"
         else:
             link = f"🚫 {blk}" if blk else "—"
-        safe_ustr = ustr.replace("_","\\_").replace("*","\\*").replace("[","\\[")
+        safe_ustr = ustr.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
         lines.append(
             f"{ico} *{i}.* {dt}\n"
             f"👤 `{e['user_id']}` {safe_ustr}\n"
-            f"📎 {e.get('content_type','текст')}: {snip}\n"
+            f"📎 {e.get('content_type', 'текст')}: {snip}\n"
             f"{link}"
         )
     await query.edit_message_text(
@@ -1249,6 +1623,7 @@ async def show_message_logs_page(query, page):
         reply_markup=_nav(page, total, "msg_page_", "msg_clear", end=True),
         disable_web_page_preview=True)
 
+
 async def show_start_logs_page(query, page):
     if not start_logs:
         await query.edit_message_text(
@@ -1256,30 +1631,70 @@ async def show_start_logs_page(query, page):
             reply_markup=_nav(0, 1, "start_page_", "start_clear"))
         return
     items, total = _paginate(start_logs, page)
-    lines = [f"👥 Пользователи — стр. {page+1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
-    for i, e in enumerate(items, page*5+1):
-        dt    = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+    lines = [f"👥 Пользователи — стр. {page + 1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
+    for i, e in enumerate(items, page * 5 + 1):
+        dt = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
         uname = e.get("username") or ""
         fname = e.get("first_name") or ""
         lname = e.get("last_name") or ""
-        ustr  = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
-        safe_ustr = ustr.replace("_","\\_").replace("*","\\*").replace("[","\\[")
+        ustr = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        safe_ustr = ustr.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
         lines.append(f"*{i}.* {dt}\n👤 `{e['user_id']}` {safe_ustr}")
     await query.edit_message_text(
         "\n\n".join(lines),
         parse_mode="Markdown",
         reply_markup=_nav(page, total, "start_page_", "start_clear"))
 
+
+async def show_anon_messages_page(query, page):
+    """Показывает логи анонимных сообщений (anon_messages_log) в админке"""
+    if not anon_messages_log:
+        await query.edit_message_text(
+            "📭 Нет анонимных сообщений в логе.",
+            reply_markup=_nav(0, 1, "anon_msg_page_", "anon_msg_clear"))
+        return
+    items, total = _paginate(anon_messages_log, page)
+    lines = [f"📨 Логи анонимных сообщений — стр. {page + 1}/{total}\n▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"]
+    for i, e in enumerate(items, page * 5 + 1):
+        dt = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+        uname = e.get("username") or ""
+        fname = e.get("first_name") or ""
+        lname = e.get("last_name") or ""
+        ustr = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        snip = (e.get("text") or "")[:80] or "—"
+        ctype = e.get("content_type", "текст")
+        mid = e.get("channel_msg_id")
+        safe_ustr = ustr.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[")
+        if mid:
+            ch = str(BOT2_CHANNEL_ID).replace("-100", "")
+            link = f"[🔗 открыть](https://t.me/c/{ch}/{mid})"
+        else:
+            link = "—"
+        lines.append(
+            f"*{i}.* {dt}\n"
+            f"👤 `{e['user_id']}` {safe_ustr}\n"
+            f"📎 Тип: {ctype}\n"
+            f"💬 {snip}\n"
+            f"{link}"
+        )
+    await query.edit_message_text(
+        "\n\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=_nav(page, total, "anon_msg_page_", "anon_msg_clear", end=True),
+        disable_web_page_preview=True)
+
+
 async def export_logs_csv(query):
     buf = io.StringIO()
-    w   = csv.DictWriter(buf, fieldnames=["user_id","username","first_name","last_name",
-                                          "content_type","text","timestamp","blocked"])
+    w = csv.DictWriter(buf, fieldnames=["user_id", "username", "first_name", "last_name",
+                                        "content_type", "text", "timestamp", "blocked"])
     w.writeheader()
     for row in message_logs:
         w.writerow({k: row.get(k, "") for k in w.fieldnames})
     f = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
     f.name = "logs.csv"
     await query.message.reply_document(document=f, filename="logs.csv", caption="📤 Экспорт логов")
+
 
 async def clean_old_logs(query):
     global message_logs
@@ -1292,22 +1707,44 @@ async def clean_old_logs(query):
         f"🧹 Удалено {before - len(message_logs)} записей старше 7 дней.",
         reply_markup=admin_keyboard())
 
-# ── ТОЧКА ВХОДА ───────────────────────────
-def main():
-    load_all_logs()
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("admin",  cmd_admin))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(
-        filters.ALL & ~filters.COMMAND & ~filters.ChatType.CHANNEL,
-        handle_message
+# ═══════════════════════════════════════════════════════════════════
+# ЗАПУСК ОБОИХ БОТОВ
+# ═══════════════════════════════════════════════════════════════════
+
+async def run_bot1():
+    """Запускает бота 1 (aiogram) — анонимные комментарии к постам"""
+    logger.info("[Bot1] Анонимные комментарии запущены!")
+    await bot1_dp.start_polling(bot1)
+
+
+def run_bot2():
+    """Запускает бота 2 (PTB) — анонимные сообщения + админка"""
+    load_all_logs()
+    app = PTBApplication.builder().token(BOT2_TOKEN).build()
+
+    app.add_handler(PTBCommandHandler("start", bot2_cmd_start))
+    app.add_handler(PTBCommandHandler("admin", bot2_cmd_admin))
+    app.add_handler(PTBCommandHandler("cancel", bot2_cmd_cancel))
+    app.add_handler(PTBCallbackQueryHandler(bot2_button_callback))
+    app.add_handler(PTBMessageHandler(
+        PTBfilters.ALL & ~PTBfilters.COMMAND & ~PTBfilters.ChatType.CHANNEL,
+        bot2_handle_message
     ))
 
-    logger.info("✅ Бот запущен!")
+    logger.info("[Bot2] Анонимные сообщения + админка запущены!")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
+
+async def main():
+    """Запускает оба бота параллельно"""
+    # Бот 2 запускаем в отдельном потоке, т.к. PTB использует свой event loop
+    bot2_thread = threading.Thread(target=run_bot2, daemon=True)
+    bot2_thread.start()
+
+    # Бот 1 запускаем в текущем event loop (aiogram)
+    await run_bot1()
+
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
