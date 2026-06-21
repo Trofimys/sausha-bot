@@ -606,15 +606,23 @@ def add_anon_message_log(entry):
     _save_json(ANON_MSGS_LOG_FILE, anon_messages_log)
 
 def add_start_log(uid, uname, fn, ln):
-    # Не добавляем дубли
+    # Не добавляем дубли в start_logs, но manual_ids проверяем всегда,
+    # чтобы пользователь не потерялся как получатель рассылки.
+    is_new = True
     for e in start_logs:
         if e.get("user_id") == uid:
-            return
-    start_logs.append({
-        "user_id": uid, "username": uname, "first_name": fn,
-        "last_name": ln, "timestamp": datetime.now().isoformat()
-    })
-    _save_json(START_LOG_FILE, start_logs)
+            is_new = False
+            break
+    if is_new:
+        start_logs.append({
+            "user_id": uid, "username": uname, "first_name": fn,
+            "last_name": ln, "timestamp": datetime.now().isoformat()
+        })
+        _save_json(START_LOG_FILE, start_logs)
+
+    if uid not in manual_ids:
+        manual_ids.append(uid)
+        save_manual_ids(manual_ids)
 
 # ── ТОП ───────────────────────────────────
 def get_top_entries() -> list[dict]:
@@ -800,6 +808,7 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
             nudity.get("sexual_display", 0),
             nudity.get("erotica", 0),
             nudity.get("very_suggestive", 0),
+            nudity.get("nude", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
         logger.info("Sightengine: sexual=%.2f offensive=%.2f", sexual_score, offensive)
@@ -890,6 +899,7 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
             nudity.get("sexual_display", 0),
             nudity.get("erotica", 0),
             nudity.get("very_suggestive", 0),
+            nudity.get("nude", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
         logger.info("Sightengine фото: sexual=%.2f offensive=%.2f", sexual_score, offensive)
@@ -953,6 +963,7 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                         nudity.get("sexual_display", 0),
                         nudity.get("erotica", 0),
                         nudity.get("very_suggestive", 0),
+                        nudity.get("nude", 0),
                     )
                     offensive = data.get("offensive", {}).get("prob", 0)
                     logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
