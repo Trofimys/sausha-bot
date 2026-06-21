@@ -55,6 +55,22 @@ SE_SECRET             = os.environ.get("SE_SECRET", "")
 SE_MONTH_LIMIT        = int(os.environ.get("SE_MONTH_LIMIT", "2000"))
 RENDER_URL            = os.environ.get("RENDER_URL", "https://sausha-bot.onrender.com")
 
+# ── Спецпсевдонимы: для определённых ID везде вместо реального имени
+#    показывается заданный текст (в логах, админке, уведомлениях и т.д.) ──
+SPECIAL_DISPLAY_NAMES: dict[int, str] = {
+    7810494142: "Всевышний Аллах",
+}
+
+def get_display_name(uid: int, username: str | None = None,
+                      first_name: str | None = None, last_name: str | None = None) -> str:
+    """Возвращает отображаемое имя пользователя с учётом спецпсевдонимов."""
+    if uid in SPECIAL_DISPLAY_NAMES:
+        return SPECIAL_DISPLAY_NAMES[uid]
+    if username:
+        return f"@{username}"
+    full = f"{first_name or ''} {last_name or ''}".strip()
+    return full or "—"
+
 if not BOT1_TOKEN or not BOT2_TOKEN:
     raise RuntimeError(
         "Не заданы BOT1_TOKEN / BOT2_TOKEN. "
@@ -100,6 +116,9 @@ bot1 = Bot(token=BOT1_TOKEN)
 bot1_dp = Dispatcher(storage=MemoryStorage())
 bot1_username_cache: str | None = None
 
+# Состояние админ-панели бота 1 (только для ADMIN_ID, один админ — словаря достаточно)
+bot1_admin_state: dict[int, str] = {}
+
 
 async def bot1_get_username() -> str:
     global bot1_username_cache
@@ -117,6 +136,250 @@ def bot1_get_pseudo(user_id: int, post_id: int) -> str:
         chosen = rng.sample(EMOJI_POOL, PSEUDO_LEN)
         bot1_user_pseudos[user_id][post_id] = "".join(chosen)
     return bot1_user_pseudos[user_id][post_id]
+
+
+def bot1_admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📩  Анонимки",       callback_data="b1_admin_tab_messages"),
+         InlineKeyboardButton(text="👥  Пользователи",   callback_data="b1_admin_tab_starts")],
+        [InlineKeyboardButton(text="📨  Логи анонимок",  callback_data="b1_admin_anon_msgs")],
+        [InlineKeyboardButton(text="📣  Рассылка",      callback_data="b1_admin_broadcast"),
+         InlineKeyboardButton(text="🏆  Топ",            callback_data="b1_admin_top")],
+        [InlineKeyboardButton(text="➕  Добавить ID",   callback_data="b1_admin_add_ids"),
+         InlineKeyboardButton(text="📋  Список ID",     callback_data="b1_admin_list_ids")],
+        [InlineKeyboardButton(text="📤  Экспорт CSV",   callback_data="b1_admin_export"),
+         InlineKeyboardButton(text="🧹  Удалить >7д",   callback_data="b1_admin_clean_old")],
+    ])
+
+
+def bot1_admin_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙  Назад в панель", callback_data="b1_admin_back")]
+    ])
+
+
+@bot1_dp.message(Command("admin"))
+async def bot1_cmd_admin(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.reply("⛔️ Доступ запрещён.")
+        return
+    await message.reply(admin_text(), reply_markup=bot1_admin_keyboard())
+
+
+def bot1_nav_keyboard(page, total, prefix, clear_cb) -> InlineKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"{prefix}{page - 1}"))
+    if page < total - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"{prefix}{page + 1}"))
+    rows = []
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🗑  Очистить всё", callback_data=clear_cb)])
+    rows.append([InlineKeyboardButton(text="🔙  Назад в панель", callback_data="b1_admin_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def bot1_show_message_logs_page(callback, page):
+    if not message_logs:
+        await callback.message.edit_text("📭 Нет анонимных сообщений.",
+                                          reply_markup=bot1_nav_keyboard(0, 1, "b1_msg_page_", "b1_msg_clear"))
+        return
+    items, total, page = _paginate(message_logs, page)
+    lines = [f"📩 Анонимки — стр. {page + 1}/{total}\n"]
+    for i, e in enumerate(items, page * 5 + 1):
+        dt = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+        name = get_display_name(e["user_id"], e.get("username"), e.get("first_name"), e.get("last_name"))
+        snip = (e.get("text") or "")[:60] or "—"
+        ico = "🚫" if e.get("blocked") else "✅"
+        lines.append(f"{ico} {i}. {dt}\n👤 {e['user_id']} {name}\n📎 {e.get('content_type', 'текст')}: {snip}")
+    await callback.message.edit_text("\n\n".join(lines),
+                                      reply_markup=bot1_nav_keyboard(page, total, "b1_msg_page_", "b1_msg_clear"))
+
+
+async def bot1_show_start_logs_page(callback, page):
+    if not start_logs:
+        await callback.message.edit_text("📭 Нет записей.",
+                                          reply_markup=bot1_nav_keyboard(0, 1, "b1_start_page_", "b1_start_clear"))
+        return
+    items, total, page = _paginate(start_logs, page)
+    lines = [f"👥 Пользователи — стр. {page + 1}/{total}\n"]
+    for i, e in enumerate(items, page * 5 + 1):
+        dt = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+        name = get_display_name(e["user_id"], e.get("username"), e.get("first_name"), e.get("last_name"))
+        lines.append(f"{i}. {dt}\n👤 {e['user_id']} {name}")
+    await callback.message.edit_text("\n\n".join(lines),
+                                      reply_markup=bot1_nav_keyboard(page, total, "b1_start_page_", "b1_start_clear"))
+
+
+async def bot1_show_anon_messages_page(callback, page):
+    if not anon_messages_log:
+        await callback.message.edit_text("📭 Нет анонимных сообщений в логе.",
+                                          reply_markup=bot1_nav_keyboard(0, 1, "b1_anon_page_", "b1_anon_clear"))
+        return
+    items, total, page = _paginate(anon_messages_log, page)
+    lines = [f"📨 Логи анонимных сообщений — стр. {page + 1}/{total}\n"]
+    for i, e in enumerate(items, page * 5 + 1):
+        dt = datetime.fromisoformat(e["timestamp"]).strftime("%d.%m.%Y %H:%M")
+        name = get_display_name(e["user_id"], e.get("username"), e.get("first_name"), e.get("last_name"))
+        snip = (e.get("text") or "")[:80] or "—"
+        lines.append(f"{i}. {dt}\n👤 {e['user_id']} {name}\n📎 {e.get('content_type', 'текст')}\n💬 {snip}")
+    await callback.message.edit_text("\n\n".join(lines),
+                                      reply_markup=bot1_nav_keyboard(page, total, "b1_anon_page_", "b1_anon_clear"))
+
+
+@bot1_dp.callback_query(F.data.startswith("b1_admin"))
+async def bot1_admin_callback(callback):
+    global message_logs
+    uid = callback.from_user.id
+    data = callback.data
+    if uid != ADMIN_ID:
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+
+    if data == "b1_admin_broadcast":
+        bot1_admin_state[uid] = "awaiting_broadcast"
+        await callback.message.edit_text(
+            "📣 Рассылка\n\nВведи текст — получат все пользователи.\n\n/cancel — отмена",
+            reply_markup=bot1_admin_back_keyboard())
+
+    elif data == "b1_admin_add_ids":
+        bot1_admin_state[uid] = "awaiting_ids"
+        await callback.message.edit_text(
+            "➕ Добавление ID\n\nОтправь числовые ID через пробел или запятую.\n\n/cancel — отмена",
+            reply_markup=bot1_admin_back_keyboard())
+
+    elif data == "b1_admin_list_ids":
+        ids = ", ".join(str(i) for i in manual_ids) if manual_ids else "пусто"
+        await callback.message.edit_text(
+            f"📋 Список ID:\n\n{ids}", reply_markup=bot1_admin_back_keyboard())
+
+    elif data == "b1_admin_top":
+        entries = get_top_entries()
+        M = ["🥇", "🥈", "🥉"]
+        lines = ["🏆 Топ анонимщиков\n"]
+        if not entries:
+            lines.append("Пока пусто 😶")
+        else:
+            for i, e in enumerate(entries[:10]):
+                m = M[i] if i < 3 else f"{i + 1}."
+                lines.append(f"{m} {e['nick']} — {e['count']} анонимок (ID: {e['user_id']})")
+        await callback.message.edit_text("\n".join(lines), reply_markup=bot1_admin_back_keyboard())
+
+    elif data == "b1_admin_export":
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=["user_id", "username", "first_name", "last_name",
+                                            "content_type", "text", "timestamp", "blocked"])
+        w.writeheader()
+        for row in message_logs:
+            w.writerow({k: row.get(k, "") for k in w.fieldnames})
+        f = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+        from aiogram.types import BufferedInputFile
+        doc = BufferedInputFile(f.getvalue(), filename="logs.csv")
+        await callback.message.answer_document(document=doc, caption="📤 Экспорт логов")
+        await callback.answer()
+
+    elif data == "b1_admin_clean_old":
+        cutoff = datetime.now().timestamp() - 7 * 86400
+        before = len(message_logs)
+        message_logs = [e for e in message_logs
+                        if datetime.fromisoformat(e["timestamp"]).timestamp() > cutoff]
+        _save_json(LOG_FILE, message_logs)
+        await callback.message.edit_text(
+            f"🧹 Удалено {before - len(message_logs)} записей старше 7 дней.",
+            reply_markup=bot1_admin_keyboard())
+
+    elif data == "b1_admin_tab_messages":
+        await bot1_show_message_logs_page(callback, 0)
+
+    elif data == "b1_admin_tab_starts":
+        await bot1_show_start_logs_page(callback, 0)
+
+    elif data == "b1_admin_anon_msgs":
+        await bot1_show_anon_messages_page(callback, 0)
+
+    elif data == "b1_admin_back":
+        bot1_admin_state.pop(uid, None)
+        await callback.message.edit_text(admin_text(), reply_markup=bot1_admin_keyboard())
+
+    await callback.answer()
+
+
+@bot1_dp.callback_query(F.data.startswith(("b1_msg_", "b1_start_", "b1_anon_")))
+async def bot1_logs_pagination_callback(callback):
+    global message_logs, start_logs, anon_messages_log
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+    data = callback.data
+
+    if data.startswith("b1_msg_page_"):
+        await bot1_show_message_logs_page(callback, int(data.rsplit("_", 1)[-1]))
+    elif data == "b1_msg_clear":
+        message_logs.clear()
+        _save_json(LOG_FILE, message_logs)
+        await callback.message.edit_text("🧹 Логи анонимок очищены.", reply_markup=bot1_admin_keyboard())
+
+    elif data.startswith("b1_start_page_"):
+        await bot1_show_start_logs_page(callback, int(data.rsplit("_", 1)[-1]))
+    elif data == "b1_start_clear":
+        start_logs.clear()
+        _save_json(START_LOG_FILE, start_logs)
+        await callback.message.edit_text("🧹 Логи стартов очищены.", reply_markup=bot1_admin_keyboard())
+
+    elif data.startswith("b1_anon_page_"):
+        await bot1_show_anon_messages_page(callback, int(data.rsplit("_", 1)[-1]))
+    elif data == "b1_anon_clear":
+        anon_messages_log.clear()
+        _save_json(ANON_MSGS_LOG_FILE, anon_messages_log)
+        await callback.message.edit_text("🧹 Логи анонимных сообщений очищены.", reply_markup=bot1_admin_keyboard())
+
+    await callback.answer()
+
+
+@bot1_dp.message(F.text, lambda m: m.from_user.id == ADMIN_ID and bot1_admin_state.get(m.from_user.id) == "awaiting_broadcast")
+async def bot1_admin_broadcast_input(message: Message):
+    bot1_admin_state.pop(message.from_user.id, None)
+    txt = message.text
+    if not txt:
+        await message.reply("❌ Сообщение не может быть пустым.")
+        return
+    all_ids = list(set(e["user_id"] for e in start_logs) | set(manual_ids))
+    if not all_ids:
+        await message.reply("📭 Нет получателей.")
+        return
+    await message.reply(f"📣 Рассылка для {len(all_ids)} чел...")
+    sent = failed = 0
+    for i in all_ids:
+        try:
+            await bot1.send_message(i, txt)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await message.reply(f"✅ Готово!\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}")
+
+
+@bot1_dp.message(F.text, lambda m: m.from_user.id == ADMIN_ID and bot1_admin_state.get(m.from_user.id) == "awaiting_ids")
+async def bot1_admin_add_ids_input(message: Message):
+    bot1_admin_state.pop(message.from_user.id, None)
+    raw = re.split(r"[,\s]+", message.text.strip())
+    added = []
+    for r in raw:
+        if not r:
+            continue
+        try:
+            n = int(r)
+        except ValueError:
+            continue
+        if n not in manual_ids:
+            manual_ids.append(n)
+            added.append(str(n))
+    if added:
+        save_manual_ids(manual_ids)
+        await message.reply(f"✅ Добавлены: {', '.join(added)}")
+    else:
+        await message.reply("⚠️ Все эти ID уже есть.")
 
 
 @bot1_dp.message(
@@ -246,7 +509,7 @@ async def bot1_cmd_start(message: Message, state: FSMContext):
                 await message.answer("❌ Неверная ссылка.")
                 return
         else:
-            await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
+            await message.answer("уебок 👋 Привет! Нажми кнопочку «• • •» своими сардельками под постом в канале, чтобы оставить анонимный комментарий.")
             return
 
         bot1_pending[message.from_user.id] = (post_id, reply_to_msg_id)
@@ -257,11 +520,14 @@ async def bot1_cmd_start(message: Message, state: FSMContext):
             "/cancel — отменить отправку комментария"
         )
     else:
-        await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
+        await message.answer("уебок 👋 Привет! Нажми кнопочку «• • •» своими сардельками под постом в канале, чтобы оставить анонимный комментарий.")
 
 
 @bot1_dp.message(Command("cancel"))
 async def bot1_cmd_cancel(message: Message, state: FSMContext):
+    if message.from_user.id == ADMIN_ID and bot1_admin_state.pop(message.from_user.id, None):
+        await message.answer("✅ Отменено.")
+        return
     await state.clear()
     bot1_pending.pop(message.from_user.id, None)
     await message.answer("❌ Отправка отменена.")
@@ -271,7 +537,7 @@ async def bot1_cmd_cancel(message: Message, state: FSMContext):
 async def bot1_notify_admin(message: Message, post_id: int, content_type: str, caption_text: str, pseudo: str):
     u = message.from_user
     ustr = f"@{u.username}" if u.username else "—"
-    name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "—"
+    name = get_display_name(u.id, u.username, u.first_name, u.last_name)
     lines = [
         "🕵️ <b>Новый анонимный комментарий (Bot1)</b>",
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
@@ -808,12 +1074,12 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
             nudity.get("sexual_display", 0),
             nudity.get("erotica", 0),
             nudity.get("very_suggestive", 0),
-            nudity.get("nude", 0),
+            nudity.get("suggestive", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
         logger.info("Sightengine: sexual=%.2f offensive=%.2f", sexual_score, offensive)
         se_increment(1)
-        if sexual_score > 0.5:
+        if sexual_score > 0.35:
             return False, f"сексуальный контент ({int(sexual_score * 100)}%)"
         if offensive > 0.7:
             return False, f"оскорбительный контент ({int(offensive * 100)}%)"
@@ -899,12 +1165,12 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
             nudity.get("sexual_display", 0),
             nudity.get("erotica", 0),
             nudity.get("very_suggestive", 0),
-            nudity.get("nude", 0),
+            nudity.get("suggestive", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
         logger.info("Sightengine фото: sexual=%.2f offensive=%.2f", sexual_score, offensive)
         se_increment(1)
-        if sexual_score > 0.5:
+        if sexual_score > 0.35:
             return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
         if offensive > 0.7:
             return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
@@ -963,12 +1229,12 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                         nudity.get("sexual_display", 0),
                         nudity.get("erotica", 0),
                         nudity.get("very_suggestive", 0),
-                        nudity.get("nude", 0),
+                        nudity.get("suggestive", 0),
                     )
                     offensive = data.get("offensive", {}).get("prob", 0)
                     logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
                     se_increment(1)
-                    if sexual_score > 0.5:
+                    if sexual_score > 0.35:
                         return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score * 100)}%)"
                     if offensive > 0.7:
                         return False, f"оскорбительный контент на {sec}-й секунде ({int(offensive * 100)}%)"
@@ -1073,7 +1339,7 @@ async def send_to_channel(context, update, text) -> int | None:
 async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None):
     u = update.effective_user
     ustr = f"@{u.username}" if u.username else "—"
-    name = f"{u.first_name or ''} {u.last_name or ''}".strip() or "—"
+    name = get_display_name(u.id, u.username, u.first_name, u.last_name)
     # Используем Markdown (v1) для уведомлений — проще и надёжнее
     ico = "🚫" if blocked_reason else "🕵️"
     lines = [
@@ -1685,7 +1951,7 @@ async def show_message_logs_page(query, page):
         uname = e.get("username") or ""
         fname = e.get("first_name") or ""
         lname = e.get("last_name") or ""
-        ustr = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        ustr = get_display_name(e["user_id"], uname, fname, lname)
         snip = (e.get("text") or "")[:60] or "—"
         blk = e.get("blocked")
         ico = "🚫" if blk else "✅"
@@ -1721,7 +1987,7 @@ async def show_start_logs_page(query, page):
         uname = e.get("username") or ""
         fname = e.get("first_name") or ""
         lname = e.get("last_name") or ""
-        ustr = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        ustr = get_display_name(e["user_id"], uname, fname, lname)
         lines.append(f"*{i}.* {dt}\n👤 `{e['user_id']}` {_safe(ustr)}")
     await query.edit_message_text(
         "\n\n".join(lines),
@@ -1742,7 +2008,7 @@ async def show_anon_messages_page(query, page):
         uname = e.get("username") or ""
         fname = e.get("first_name") or ""
         lname = e.get("last_name") or ""
-        ustr = f"@{uname}" if uname else f"{fname} {lname}".strip() or "—"
+        ustr = get_display_name(e["user_id"], uname, fname, lname)
         snip = (e.get("text") or "")[:80] or "—"
         ctype = e.get("content_type", "текст")
         mid = e.get("channel_msg_id")
