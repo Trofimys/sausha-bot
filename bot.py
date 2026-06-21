@@ -58,6 +58,10 @@ SE_MONTH_LIMIT = int(os.environ.get("SE_MONTH_LIMIT", "2000"))
 
 RENDER_URL = os.environ.get("RENDER_URL", "https://sausha-bot.onrender.com")
 
+# Жёсткая модерация
+SIGHTENGINE_STRICT = True   # блокировать контент при ошибке API
+NUDITY_THRESHOLD = 0.1      # порог эротики (0.1 = очень строго)
+
 SPECIAL_DISPLAY_NAMES: dict[int, str] = {
     7810494142: "Всевышний Аллах",
 }
@@ -101,6 +105,7 @@ PSEUDO_LEN = 4
 class AnonState(StatesGroup):
     waiting_text = State()
 
+# Хранилища бота 1
 bot1_user_pseudos: dict[int, dict[int, str]] = {}
 bot1_pending: dict[int, tuple[int, int]] = {}
 bot1_post_to_discussion_id: dict[int, int] = {}
@@ -123,8 +128,6 @@ async def _bot1_get_file_url(file_id: str) -> str | None:
         return None
 
 async def _bot1_sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
-    if not SE_USER or not SE_SECRET:
-        return True, ""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -136,9 +139,11 @@ async def _bot1_sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
                 },
                 files={"media": ("image.jpg", image_bytes, "image/jpeg")}
             )
+        logger.info(f"[Bot1] Sightengine ответ: {r.status_code} {r.text[:300]}")
         if r.status_code != 200:
             logger.error(f"[Bot1] Sightengine error: {r.text}")
-            return True, ""
+            return (False, "ошибка сервиса проверки") if SIGHTENGINE_STRICT else (True, "")
+
         data = r.json()
         nudity = data.get("nudity", {})
         sexual_score = max(
@@ -149,15 +154,17 @@ async def _bot1_sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
             nudity.get("suggestive", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
+        logger.info(f"[Bot1] Sightengine: sexual={sexual_score:.2f} offensive={offensive:.2f}")
         se_increment(1)
-        if sexual_score > 0.35:
+
+        if sexual_score > NUDITY_THRESHOLD:
             return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
         if offensive > 0.7:
             return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
         return True, ""
     except Exception as e:
         logger.error(f"[Bot1] Sightengine bytes check error: {e}")
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
 
 async def _bot1_convert_to_jpg(input_bytes: bytes, suffix: str) -> bytes | None:
     input_path = None
@@ -191,10 +198,10 @@ async def _bot1_convert_to_jpg(input_bytes: bytes, suffix: str) -> bytes | None:
 
 async def _bot1_check_photo(file_id: str) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return True, ""
+        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
     url = await _bot1_get_file_url(file_id)
     if not url:
-        return True, ""
+        return (False, "не удалось получить файл") if SIGHTENGINE_STRICT else (True, "")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.get(
@@ -206,8 +213,11 @@ async def _bot1_check_photo(file_id: str) -> tuple[bool, str]:
                     "api_secret": SE_SECRET,
                 }
             )
+        logger.info(f"[Bot1] Sightengine photo ответ: {r.status_code} {r.text[:300]}")
         if r.status_code != 200:
-            return True, ""
+            logger.error(f"[Bot1] Sightengine photo error: {r.text}")
+            return (False, "ошибка сервиса") if SIGHTENGINE_STRICT else (True, "")
+
         data = r.json()
         nudity = data.get("nudity", {})
         sexual_score = max(
@@ -218,19 +228,21 @@ async def _bot1_check_photo(file_id: str) -> tuple[bool, str]:
             nudity.get("suggestive", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
+        logger.info(f"[Bot1] Photo: sexual={sexual_score:.2f} offensive={offensive:.2f}")
         se_increment(1)
-        if sexual_score > 0.35:
+
+        if sexual_score > NUDITY_THRESHOLD:
             return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
         if offensive > 0.7:
             return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
         return True, ""
     except Exception as e:
         logger.error(f"[Bot1] photo check error: {e}")
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
 
 async def _bot1_check_sticker(sticker) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return True, ""
+        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
     try:
         tg_file = await bot1.get_file(sticker.file_id)
         file_bytes = bytes(await bot1.download_file(tg_file.file_path))
@@ -241,15 +253,15 @@ async def _bot1_check_sticker(sticker) -> tuple[bool, str]:
         else:
             jpg = await _bot1_convert_to_jpg(file_bytes, ".webp")
         if not jpg:
-            return True, ""
+            return (False, "не удалось конвертировать") if SIGHTENGINE_STRICT else (True, "")
         return await _bot1_sightengine_check_bytes(jpg)
     except Exception as e:
         logger.error(f"[Bot1] sticker check error: {e}")
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
 
 async def _bot1_check_video(file_id: str) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return True, ""
+        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
     video_path = None
     try:
         tg_file = await bot1.get_file(file_id)
@@ -282,7 +294,7 @@ async def _bot1_check_video(file_id: str) -> tuple[bool, str]:
         return True, ""
     except Exception as e:
         logger.error(f"[Bot1] video check error: {e}")
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
     finally:
         if video_path and os.path.exists(video_path):
             try:
@@ -749,6 +761,7 @@ async def send_anon_comment(
     post_id, reply_to_msg_id = data
     pseudo = bot1_get_pseudo(user_id, post_id)
 
+    # Модерация
     ok, reason = True, ""
     try:
         if content_type == "photo":
@@ -1236,8 +1249,6 @@ async def _get_tg_file_url(bot, file_id: str) -> str | None:
         return None
 
 async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
-    if not SE_USER or not SE_SECRET:
-        return True, ""
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -1245,9 +1256,11 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
                 data={"models": "nudity-2.1,offensive", "api_user": SE_USER, "api_secret": SE_SECRET},
                 files={"media": ("image.jpg", image_bytes, "image/jpeg")}
             )
+        logger.info(f"[Bot2] Sightengine ответ: {r.status_code} {r.text[:300]}")
         if r.status_code != 200:
-            logger.error("Sightengine error: %s", r.text)
-            return True, ""
+            logger.error(f"[Bot2] Sightengine error: {r.text}")
+            return (False, "ошибка сервиса проверки") if SIGHTENGINE_STRICT else (True, "")
+
         data = r.json()
         nudity = data.get("nudity", {})
         sexual_score = max(
@@ -1256,15 +1269,17 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
             nudity.get("suggestive", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
+        logger.info(f"[Bot2] Sightengine: sexual={sexual_score:.2f} offensive={offensive:.2f}")
         se_increment(1)
-        if sexual_score > 0.35:
+
+        if sexual_score > NUDITY_THRESHOLD:
             return False, f"сексуальный контент ({int(sexual_score * 100)}%)"
         if offensive > 0.7:
             return False, f"оскорбительный контент ({int(offensive * 100)}%)"
         return True, ""
     except Exception as e:
-        logger.error("Sightengine bytes check error: %s", e)
-        return True, ""
+        logger.error(f"[Bot2] Sightengine bytes check error: {e}")
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
 
 async def _convert_to_jpg_bytes(input_bytes: bytes, suffix: str) -> bytes | None:
     input_path = None
@@ -1298,7 +1313,7 @@ async def _convert_to_jpg_bytes(input_bytes: bytes, suffix: str) -> bytes | None
 
 async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return True, ""
+        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
     try:
         tg_file = await bot.get_file(sticker.file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -1309,18 +1324,18 @@ async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
         else:
             jpg = await _convert_to_jpg_bytes(file_bytes, ".webp")
         if not jpg:
-            return True, ""
+            return (False, "не удалось конвертировать") if SIGHTENGINE_STRICT else (True, "")
         return await _sightengine_check_bytes(jpg)
     except Exception as e:
         logger.error("Ошибка проверки стикера: %s", e)
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
 
 async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return True, ""
+        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
     url = await _get_tg_file_url(bot, file_id)
     if not url:
-        return True, ""
+        return (False, "не удалось получить файл") if SIGHTENGINE_STRICT else (True, "")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.get(
@@ -1332,8 +1347,11 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
                     "api_secret": SE_SECRET,
                 }
             )
+        logger.info(f"[Bot2] Sightengine photo ответ: {r.status_code} {r.text[:300]}")
         if r.status_code != 200:
-            return True, ""
+            logger.error(f"[Bot2] Sightengine photo error: {r.text}")
+            return (False, "ошибка сервиса") if SIGHTENGINE_STRICT else (True, "")
+
         data = r.json()
         nudity = data.get("nudity", {})
         sexual_score = max(
@@ -1342,19 +1360,21 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
             nudity.get("suggestive", 0),
         )
         offensive = data.get("offensive", {}).get("prob", 0)
+        logger.info(f"[Bot2] Photo: sexual={sexual_score:.2f} offensive={offensive:.2f}")
         se_increment(1)
-        if sexual_score > 0.35:
+
+        if sexual_score > NUDITY_THRESHOLD:
             return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
         if offensive > 0.7:
             return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
         return True, ""
     except Exception as e:
         logger.error("Ошибка проверки изображения Sightengine: %s", e)
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
 
 async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return True, ""
+        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
     video_path = None
     try:
         tg_file = await bot.get_file(file_id)
@@ -1362,6 +1382,7 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
             vf.write(bytes(video_bytes))
             video_path = vf.name
+
         for sec in [1, 3, 6]:
             frame_path = f"{video_path}_frame_{sec}.jpg"
             proc = await asyncio.create_subprocess_exec(
@@ -1377,8 +1398,10 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                 await asyncio.wait_for(proc.communicate(), timeout=15)
             except asyncio.TimeoutError:
                 continue
+
             if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
                 continue
+
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     with open(frame_path, "rb") as f:
@@ -1400,8 +1423,10 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                         nudity.get("suggestive", 0),
                     )
                     offensive = data.get("offensive", {}).get("prob", 0)
+                    logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
                     se_increment(1)
-                    if sexual_score > 0.35:
+
+                    if sexual_score > NUDITY_THRESHOLD:
                         return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score * 100)}%)"
                     if offensive > 0.7:
                         return False, f"оскорбительный контент на {sec}-й секунде ({int(offensive * 100)}%)"
@@ -1410,10 +1435,11 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
             finally:
                 if os.path.exists(frame_path):
                     os.unlink(frame_path)
+
         return True, ""
     except Exception as e:
         logger.error("Ошибка проверки видео: %s", e)
-        return True, ""
+        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
     finally:
         if video_path and os.path.exists(video_path):
             os.unlink(video_path)
@@ -1454,8 +1480,10 @@ async def send_to_channel(context, update, text) -> int | None:
     safe = escape_mdv2(text) if text else ""
     bot_username = "Shkola6_anonchik_bot"
     footer = f"[✉️ Отправить анонимку](https://t.me/{bot_username})"
+
     caption = f"{header}\n\n{safe}" if safe else header
     full = f"{caption}\n\n{footer}"
+
     msg = update.message
     bot = context.bot
     try:
@@ -1508,6 +1536,7 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
     if ctext:
         safe_text = ctext[:300].replace("`", "'")
         lines.append(f"💬 Текст:\n`{safe_text}`")
+
     caption = "\n".join(lines)
     msg = update.message
     bot = context.bot
@@ -1644,6 +1673,29 @@ async def bot2_cmd_admin(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔️ Доступ запрещён.")
         return
     await update.message.reply_text(admin_text(), reply_markup=admin_keyboard())
+
+# Команда /okak - проверка API ключа Sightengine
+async def okak_command(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только для админа")
+        return
+    msg = await update.message.reply_text("🔍 Проверяю ключ Sightengine...")
+    test_image = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c626000000002000188f8e5b0000000049454e44ae426082")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post("https://api.sightengine.com/1.0/check.json",
+                data={"models": "nudity-2.1,offensive", "api_user": SE_USER, "api_secret": SE_SECRET},
+                files={"media": ("test.png", test_image, "image/png")})
+        result_text = f"📡 Статус: {r.status_code}\n\n"
+        if r.status_code == 200:
+            data = r.json()
+            result_text += "✅ API работает!\n\n"
+            result_text += f"```json\n{json.dumps(data, indent=2, ensure_ascii=False)[:1500]}\n```"
+        else:
+            result_text += f"❌ Ошибка API:\n```\n{r.text[:500]}\n```"
+        await msg.edit_text(result_text, parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка подключения:\n```\n{str(e)[:500]}\n```", parse_mode="Markdown")
 
 async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2166,6 +2218,7 @@ def run_bot2():
         app.add_handler(PTBCommandHandler("start", bot2_cmd_start))
         app.add_handler(PTBCommandHandler("admin", bot2_cmd_admin))
         app.add_handler(PTBCommandHandler("cancel", bot2_cmd_cancel))
+        app.add_handler(PTBCommandHandler("okak", okak_command))
         app.add_handler(PTBCallbackQueryHandler(bot2_button_callback))
         app.add_handler(PTBMessageHandler(
             PTBfilters.ALL & ~PTBfilters.COMMAND & ~PTBfilters.ChatType.CHANNEL,
