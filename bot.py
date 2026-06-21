@@ -17,7 +17,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── aiogram (бот 1: анонимные комментарии) ──
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -50,8 +50,8 @@ BOT2_TOKEN            = os.environ.get("BOT2_TOKEN", "")
 BOT2_CHANNEL_ID       = int(os.environ.get("BOT2_CHANNEL_ID", "-1003854171715"))
 GROQ_API_KEY          = os.environ.get("GROQ_API_KEY", "")
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8627543263"))
-SE_USER               = os.environ.get("SE_USER", "")
-SE_SECRET             = os.environ.get("SE_SECRET", "")
+SE_USER               = os.environ.get("SE_USER", "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd")
+SE_SECRET             = os.environ.get("SE_SECRET", "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd")
 SE_MONTH_LIMIT        = int(os.environ.get("SE_MONTH_LIMIT", "2000"))
 RENDER_URL            = os.environ.get("RENDER_URL", "https://sausha-bot.onrender.com")
 
@@ -119,6 +119,196 @@ bot1_username_cache: str | None = None
 # Состояние админ-панели бота 1 (только для ADMIN_ID, один админ — словаря достаточно)
 bot1_admin_state: dict[int, str] = {}
 
+# ── Модерация для Bot1 (Sightengine + Groq) ─────────────────────
+async def _bot1_get_file_url(file_id: str) -> str | None:
+    try:
+        tg_file = await bot1.get_file(file_id)
+        return f"https://api.telegram.org/file/bot{BOT1_TOKEN}/{tg_file.file_path}"
+    except Exception as e:
+        logger.error(f"[Bot1] Ошибка получения file_url: {e}")
+        return None
+
+async def _bot1_sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
+    if not SE_USER or not SE_SECRET:
+        return True, ""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                "https://api.sightengine.com/1.0/check.json",
+                data={
+                    "models": "nudity-2.1,offensive",
+                    "api_user": SE_USER,
+                    "api_secret": SE_SECRET,
+                },
+                files={"media": ("image.jpg", image_bytes, "image/jpeg")}
+            )
+        if r.status_code != 200:
+            logger.error(f"[Bot1] Sightengine error: {r.text}")
+            return True, ""
+        data = r.json()
+        nudity = data.get("nudity", {})
+        sexual_score = max(
+            nudity.get("sexual_activity", 0),
+            nudity.get("sexual_display", 0),
+            nudity.get("erotica", 0),
+            nudity.get("very_suggestive", 0),
+            nudity.get("suggestive", 0),
+        )
+        offensive = data.get("offensive", {}).get("prob", 0)
+        se_increment(1)
+        if sexual_score > 0.35:
+            return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
+        if offensive > 0.7:
+            return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
+        return True, ""
+    except Exception as e:
+        logger.error(f"[Bot1] Sightengine bytes check error: {e}")
+        return True, ""
+
+async def _bot1_convert_to_jpg(input_bytes: bytes, suffix: str) -> bytes | None:
+    input_path = None
+    output_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(input_bytes)
+            input_path = f.name
+        output_path = input_path + "_out.jpg"
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", input_path,
+            "-vframes", "1", "-q:v", "2", output_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=20)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            with open(output_path, "rb") as f:
+                return f.read()
+        return None
+    except Exception as e:
+        logger.error(f"[Bot1] ffmpeg конвертация: {e}")
+        return None
+    finally:
+        for p in [input_path, output_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+
+async def _bot1_check_photo(file_id: str) -> tuple[bool, str]:
+    if not SE_USER or not SE_SECRET:
+        return True, ""
+    url = await _bot1_get_file_url(file_id)
+    if not url:
+        return True, ""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                "https://api.sightengine.com/1.0/check.json",
+                params={
+                    "url": url,
+                    "models": "nudity-2.1,offensive",
+                    "api_user": SE_USER,
+                    "api_secret": SE_SECRET,
+                }
+            )
+        if r.status_code != 200:
+            return True, ""
+        data = r.json()
+        nudity = data.get("nudity", {})
+        sexual_score = max(
+            nudity.get("sexual_activity", 0),
+            nudity.get("sexual_display", 0),
+            nudity.get("erotica", 0),
+            nudity.get("very_suggestive", 0),
+            nudity.get("suggestive", 0),
+        )
+        offensive = data.get("offensive", {}).get("prob", 0)
+        se_increment(1)
+        if sexual_score > 0.35:
+            return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
+        if offensive > 0.7:
+            return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
+        return True, ""
+    except Exception as e:
+        logger.error(f"[Bot1] photo check error: {e}")
+        return True, ""
+
+async def _bot1_check_sticker(sticker) -> tuple[bool, str]:
+    if not SE_USER or not SE_SECRET:
+        return True, ""
+    try:
+        tg_file = await bot1.get_file(sticker.file_id)
+        file_bytes = bytes(await bot1.download_file(tg_file.file_path))
+        if sticker.is_animated:
+            jpg = await _bot1_convert_to_jpg(file_bytes, ".tgs")
+        elif sticker.is_video:
+            jpg = await _bot1_convert_to_jpg(file_bytes, ".webm")
+        else:
+            jpg = await _bot1_convert_to_jpg(file_bytes, ".webp")
+        if not jpg:
+            return True, ""
+        return await _bot1_sightengine_check_bytes(jpg)
+    except Exception as e:
+        logger.error(f"[Bot1] sticker check error: {e}")
+        return True, ""
+
+async def _bot1_check_video(file_id: str) -> tuple[bool, str]:
+    if not SE_USER or not SE_SECRET:
+        return True, ""
+    video_path = None
+    try:
+        tg_file = await bot1.get_file(file_id)
+        video_bytes = bytes(await bot1.download_file(tg_file.file_path))
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as vf:
+            vf.write(video_bytes)
+            video_path = vf.name
+
+        for sec in [1, 3, 6]:
+            frame_path = f"{video_path}_frame_{sec}.jpg"
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", video_path,
+                "-ss", f"00:00:0{sec}",
+                "-vframes", "1", "-q:v", "2", frame_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+            if not os.path.exists(frame_path) or os.path.getsize(frame_path) == 0:
+                continue
+
+            with open(frame_path, "rb") as f:
+                ok, reason = await _bot1_sightengine_check_bytes(f.read())
+            try:
+                os.unlink(frame_path)
+            except Exception:
+                pass
+            if not ok:
+                return False, f"сексуальный/оскорбительный контент на {sec}‑й секунде ({reason})"
+        return True, ""
+    except Exception as e:
+        logger.error(f"[Bot1] video check error: {e}")
+        return True, ""
+    finally:
+        if video_path and os.path.exists(video_path):
+            try:
+                os.unlink(video_path)
+            except Exception:
+                pass
+
+async def _bot1_check_text(text: str) -> tuple[bool, str]:
+    if not GROQ_API_KEY or not text:
+        return True, ""
+    res = await call_groq_simple(text, CONTENT_CHECK_PROMPT, as_json=True)
+    if not res:
+        return True, ""
+    try:
+        cleaned = res.strip().removeprefix("```json").removesuffix("```").strip()
+        p = json.loads(cleaned)
+        ok = bool(p.get("acceptable", True))
+        return ok, ("" if ok else p.get("reason", ""))
+    except Exception:
+        return True, ""
 
 async def bot1_get_username() -> str:
     global bot1_username_cache
@@ -274,7 +464,6 @@ async def bot1_admin_callback(callback):
         for row in message_logs:
             w.writerow({k: row.get(k, "") for k in w.fieldnames})
         f = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
-        from aiogram.types import BufferedInputFile
         doc = BufferedInputFile(f.getvalue(), filename="logs.csv")
         await callback.message.answer_document(document=doc, caption="📤 Экспорт логов")
         await callback.answer()
@@ -404,7 +593,6 @@ async def bot1_on_channel_post(message: Message):
     logger.info(f"[Bot1] Новый пост: {post_id}")
 
     # Ждём форвард в дискуссию (до 15 секунд, проверяем каждые 2 сек)
-    # Это лучше чем просто sleep(5), т.к. не блокирует надолго при быстром форварде
     for _ in range(8):
         if post_id in bot1_post_to_discussion_id:
             break
@@ -557,7 +745,7 @@ async def bot1_notify_admin(message: Message, post_id: int, content_type: str, c
         logger.warning(f"[Bot1] Не удалось уведомить админа: {e}")
 
 
-# ── Общая функция отправки анонимного комментария (любой тип) ──
+# ── Общая функция отправки анонимного комментария (с модерацией) ──
 async def send_anon_comment(
     message: Message,
     state: FSMContext,
@@ -575,6 +763,45 @@ async def send_anon_comment(
 
     post_id, reply_to_msg_id = data
     pseudo = bot1_get_pseudo(user_id, post_id)
+
+    # ── Модерация контента ──
+    ok, reason = True, ""
+    try:
+        if content_type == "photo":
+            ok, reason = await _bot1_check_photo(file_id)
+        elif content_type == "sticker":
+            ok, reason = await _bot1_check_sticker(message.sticker)
+        elif content_type in ("video", "animation"):
+            ok, reason = await _bot1_check_video(file_id)
+        elif content_type == "text":
+            ok, reason = await _bot1_check_text(caption_text)
+    except Exception as e:
+        logger.error(f"[Bot1] Ошибка модерации: {e}")
+
+    if not ok:
+        await state.clear()
+        bot1_pending.pop(user_id, None)
+        await message.reply(
+            f"🚫 *Ваш комментарий не прошёл модерацию.*\n\n"
+            f"Причина: _{reason}_\n\n"
+            f"Пожалуйста, отправьте что‑то другое.",
+            parse_mode="Markdown"
+        )
+        # Уведомление админу о блокировке
+        try:
+            await bot1.send_message(
+                ADMIN_ID,
+                f"🚫 *Заблокирован комментарий (Bot1)*\n"
+                f"👤 {message.from_user.full_name} (`{user_id}`)\n"
+                f"📎 Тип: {content_type}\n"
+                f"❌ Причина: {reason}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        return
+
+    # ── Отправка в канал ──
     pseudo_block = f"<blockquote>{pseudo}</blockquote>"
     full_caption = f"{pseudo_block}\n{caption_text}" if caption_text else pseudo_block
 
@@ -872,8 +1099,6 @@ def add_anon_message_log(entry):
     _save_json(ANON_MSGS_LOG_FILE, anon_messages_log)
 
 def add_start_log(uid, uname, fn, ln):
-    # Не добавляем дубли в start_logs, но manual_ids проверяем всегда,
-    # чтобы пользователь не потерялся как получатель рассылки.
     is_new = True
     for e in start_logs:
         if e.get("user_id") == uid:
@@ -1032,14 +1257,13 @@ async def call_groq_with_context(uid: int, user_msg: str) -> str:
                 return "⚠️ ИИ временно недоступен, попробуй позже."
             reply = d["choices"][0]["message"]["content"]
             history += [{"role": "user", "content": user_msg}, {"role": "assistant", "content": reply}]
-            # Держим не больше 6 сообщений в истории (3 обмена)
             user_ai_context[uid] = history[-6:]
             return reply
         except Exception as e:
             logger.error("Groq ctx: %s", e)
             return "⚠️ Ошибка сети."
 
-# ── SIGHTENGINE МОДЕРАЦИЯ ─────────────────
+# ── SIGHTENGINE МОДЕРАЦИЯ (Bot2) ─────────────────
 async def _get_tg_file_url(bot, file_id: str) -> str | None:
     try:
         tg_file = await bot.get_file(file_id)
@@ -1292,9 +1516,7 @@ async def send_to_channel(context, update, text) -> int | None:
     Для медиа MarkdownV2 caption, для текста — тоже MarkdownV2.
     """
     header = "*📩 Анонимное сообщение*"
-    # Экранируем пользовательский текст для MarkdownV2
     safe = escape_mdv2(text) if text else ""
-    # Ссылка в footer — уже корректный MarkdownV2
     bot_username = "Shkola6_anonchik_bot"  # имя бота 2
     footer = f"[✉️ Отправить анонимку](https://t.me/{bot_username})"
 
@@ -1340,7 +1562,6 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
     u = update.effective_user
     ustr = f"@{u.username}" if u.username else "—"
     name = get_display_name(u.id, u.username, u.first_name, u.last_name)
-    # Используем Markdown (v1) для уведомлений — проще и надёжнее
     ico = "🚫" if blocked_reason else "🕵️"
     lines = [
         f"{ico} *{'ЗАБЛОКИРОВАНО' if blocked_reason else 'Новая анонимка'}*",
@@ -1799,7 +2020,6 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
 
 
 def _log_blocked(uid, update, ctype, text, reason, now):
-    """Вспомогательная: записать заблокированное сообщение"""
     add_message_log({
         "user_id": uid,
         "username": update.effective_user.username,
@@ -1915,7 +2135,7 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
 def _paginate(items, page, per=5):
     total = max(1, (len(items) + per - 1) // per)
     page = max(0, min(page, total - 1))
-    return items[page * per:(page + 1) * per], total, page  # возвращаем скорректированный page
+    return items[page * per:(page + 1) * per], total, page
 
 def _nav(page, total, prefix, clear_cb, end=False):
     nav = []
@@ -1934,7 +2154,6 @@ def _nav(page, total, prefix, clear_cb, end=False):
 
 
 def _safe(s: str) -> str:
-    """Экранирует спецсимволы Markdown v1 в тексте для логов"""
     return s.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`").replace("[", "\\[")
 
 
