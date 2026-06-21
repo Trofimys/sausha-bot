@@ -1,0 +1,18 @@
+# Секреты — НИКОГДА не коммитить!
+.env
+
+# Данные бота (JSON-файлы с логами и топом)
+*.json
+se_checks.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Временные файлы
+*.tmp
+*.log
