@@ -242,7 +242,7 @@ async def _bot1_check_photo(file_id: str) -> tuple[bool, str]:
 
 async def _bot1_check_sticker(sticker) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
+        return (True, "")  # исправлено: пропускаем стикеры при отсутствии ключа
     try:
         tg_file = await bot1.get_file(sticker.file_id)
         file_bytes = bytes(await bot1.download_file(tg_file.file_path))
@@ -253,11 +253,12 @@ async def _bot1_check_sticker(sticker) -> tuple[bool, str]:
         else:
             jpg = await _bot1_convert_to_jpg(file_bytes, ".webp")
         if not jpg:
-            return (False, "не удалось конвертировать") if SIGHTENGINE_STRICT else (True, "")
+            logger.warning("[Bot1] Стикер не конвертирован — пропускаем без проверки")
+            return (True, "")  # пропускаем, если не удалось конвертировать
         return await _bot1_sightengine_check_bytes(jpg)
     except Exception as e:
         logger.error(f"[Bot1] sticker check error: {e}")
-        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
+        return (True, "")  # при ошибке тоже пропускаем
 
 async def _bot1_check_video(file_id: str) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
@@ -1313,7 +1314,7 @@ async def _convert_to_jpg_bytes(input_bytes: bytes, suffix: str) -> bytes | None
 
 async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
-        return (False, "API-ключ не настроен") if SIGHTENGINE_STRICT else (True, "")
+        return (True, "")  # исправлено: пропускаем стикеры при отсутствии ключа
     try:
         tg_file = await bot.get_file(sticker.file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -1324,11 +1325,12 @@ async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
         else:
             jpg = await _convert_to_jpg_bytes(file_bytes, ".webp")
         if not jpg:
-            return (False, "не удалось конвертировать") if SIGHTENGINE_STRICT else (True, "")
+            logger.warning("[Bot2] Стикер не конвертирован — пропускаем без проверки")
+            return (True, "")
         return await _sightengine_check_bytes(jpg)
     except Exception as e:
         logger.error("Ошибка проверки стикера: %s", e)
-        return (False, "ошибка проверки") if SIGHTENGINE_STRICT else (True, "")
+        return (True, "")
 
 async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
     if not SE_USER or not SE_SECRET:
