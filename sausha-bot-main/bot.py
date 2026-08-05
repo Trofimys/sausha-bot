@@ -52,6 +52,7 @@ BOT2_USERNAME         = os.environ.get("BOT2_USERNAME", "Shkola6_anonchik_bot") 
 BOT2_CHAT_INVITE      = os.environ.get("BOT2_CHAT_INVITE", "https://t.me/+N1hmM9BYc1VkZWQ1")  # ссылка на чат
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8627543263"))
 MODERATION_LOG_CHANNEL_ID = int(os.environ.get("MODERATION_LOG_CHANNEL_ID", "-1003911650264"))
+MODERATION_LOG_CHANNEL_LINK = os.environ.get("MODERATION_LOG_CHANNEL_LINK", "https://t.me/drsgdfg")
 SE_USER               = "422568370"  # зашито напрямую по просьбе
 SE_SECRET             = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"  # зашито напрямую по просьбе
 SE_MONTH_LIMIT        = int(os.environ.get("SE_MONTH_LIMIT", "2000"))
@@ -1513,10 +1514,26 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
         logger.error("Админ-уведомление: %s", e)
 
     if blocked_reason:
-        await post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason)
+        log_msg_id = await post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason)
+        if log_msg_id:
+            await announce_blocked_in_main_channel(context, log_msg_id)
 
 
-async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason):
+async def announce_blocked_in_main_channel(context, log_msg_id: int):
+    """В основной канал — только анонс со ссылкой на пост в канале логов."""
+    link = f"{MODERATION_LOG_CHANNEL_LINK.rstrip('/')}/{log_msg_id}"
+    try:
+        await context.bot.send_message(
+            BOT2_CHANNEL_ID,
+            f">[🚫 Новая запрещённая анонимка]({link})",
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error("Анонс блокировки в основной канал: %s", e)
+
+
+async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason) -> int | None:
     """Дублирует карточку заблокированного контента в канал логов — без данных автора."""
     lines = [
         "🚫 *ЗАБЛОКИРОВАНО*",
@@ -1534,21 +1551,23 @@ async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_rea
     chat_id = MODERATION_LOG_CHANNEL_ID
     try:
         if msg.photo:
-            await bot.send_photo(chat_id, msg.photo[-1].file_id,
-                                 caption=caption, parse_mode="Markdown")
-        elif msg.video:
-            await bot.send_video(chat_id, msg.video.file_id,
-                                 caption=caption, parse_mode="Markdown")
-        elif msg.animation:
-            await bot.send_animation(chat_id, msg.animation.file_id,
+            s = await bot.send_photo(chat_id, msg.photo[-1].file_id,
                                      caption=caption, parse_mode="Markdown")
+        elif msg.video:
+            s = await bot.send_video(chat_id, msg.video.file_id,
+                                     caption=caption, parse_mode="Markdown")
+        elif msg.animation:
+            s = await bot.send_animation(chat_id, msg.animation.file_id,
+                                         caption=caption, parse_mode="Markdown")
         elif msg.sticker:
-            await bot.send_message(chat_id, caption, parse_mode="Markdown")
+            s = await bot.send_message(chat_id, caption, parse_mode="Markdown")
             await bot.send_sticker(chat_id, msg.sticker.file_id)
         else:
-            await bot.send_message(chat_id, caption, parse_mode="Markdown")
+            s = await bot.send_message(chat_id, caption, parse_mode="Markdown")
+        return s.message_id if s else None
     except Exception as e:
         logger.error("Лог модерации в канал: %s", e)
+        return None
 
 # ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():

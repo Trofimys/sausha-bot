@@ -57,6 +57,8 @@ cd sausha-bot-main; python main.py  # только сауша-бот
 | `BOT1_CHANNEL_ID`, `BOT1_DISCUSSION_CHAT_ID` | нет | ID канала и чата обсуждения |
 | `BOT2_CHANNEL_ID`, `BOT2_USERNAME`, `BOT2_CHAT_INVITE` | нет | канал/имя/инвайт для бота 2 |
 | `ADMIN_ID` | нет | ID админа сауша-бота (у него своя админка) |
+| `MODERATION_LOG_CHANNEL_ID` | нет | канал, куда падает заблокированный ИИ контент |
+| `MODERATION_LOG_CHANNEL_LINK` | нет | публичная ссылка на этот канал (для анонса в основном канале) |
 | `RENDER_URL` | нет | URL сервиса для self-ping keep-alive |
 | `SAUSHA_HTTP_PORT` | нет | внутренний порт keep-alive сауши (по умолчанию 10000; под супервизором можно не трогать) |
 
