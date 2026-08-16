@@ -57,24 +57,24 @@ def load_settings() -> Settings:
         candidate = Path(start_image_path_raw).expanduser()
         if candidate.exists():
             start_image_path = candidate
-    else:
-        for pattern in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
-            matches = sorted(Path(".").glob(pattern))
-            if matches:
-                start_image_path = matches[0]
-                break
+    if start_image_path is None and Path("start_welcome.png").exists():
+        start_image_path = Path("start_welcome.png")
 
     profile_image_path: Path | None = None
     if profile_image_path_raw:
         candidate = Path(profile_image_path_raw).expanduser()
         if candidate.exists():
             profile_image_path = candidate
+    if profile_image_path is None and Path("profile_screen.png").exists():
+        profile_image_path = Path("profile_screen.png")
 
     top_up_image_path: Path | None = None
     if top_up_image_path_raw:
         candidate = Path(top_up_image_path_raw).expanduser()
         if candidate.exists():
             top_up_image_path = candidate
+    if top_up_image_path is None and Path("balance_top_up.png").exists():
+        top_up_image_path = Path("balance_top_up.png")
 
     return Settings(
         bot_token=bot_token,

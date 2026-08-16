@@ -669,6 +669,9 @@ class BotApp:
             self.purchase_with_balance(callback, purpose, value)
             return
 
+        # Мгновенный ответ Telegram, чтобы кнопка не крутилась и интерфейс не подвисал
+        self.answer_callback(callback)
+
         if method in {"sbp", "card"}:
             self.create_yookassa_payment(callback, purpose, value, method)
             return
@@ -1011,6 +1014,7 @@ class BotApp:
         )
 
     def check_invoice(self, callback: dict[str, Any], invoice_id: str) -> None:
+        self.answer_callback(callback, "Проверяем оплату...")
         message = callback.get("message")
         if not message:
             return
