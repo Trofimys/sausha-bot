@@ -13,7 +13,17 @@ from urllib.request import Request, urlopen
 
 
 class TelegramAPIError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        error_code: int | None = None,
+        description: str | None = None,
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.description = description or message
+        self.parameters = parameters or {}
 
 
 class TelegramAPI:
@@ -31,12 +41,11 @@ class TelegramAPI:
         retries: int = 3,
         retry_delay: float = 2.0,
     ) -> Any:
-        """Читает JSON-ответ Telegram с ретраями на сетевых сбоях.
+        """Читает JSON-ответ Telegram с ретраями на сетевых сбоях и 429 rate limit.
 
-        Через прокси одиночный блип соединения не должен ронять запрос —
-        иначе, например, ответ на /start молча теряется. Ретраим только
-        транспортные ошибки (URLError/TimeoutError); HTTPError (400/403 и т.п.)
-        — это ответ Telegram, повторять его бессмысленно.
+        Через прокси одиночный блип соединения не должен ронять запрос.
+        Для HTTPError считывает тело ошибки ответа Telegram (включая
+        "message is not modified", 403 bot blocked, 429 retry_after).
         """
         last_error: Exception | None = None
         for attempt in range(1, retries + 1):
@@ -45,7 +54,57 @@ class TelegramAPI:
                     raw = response.read().decode("utf-8")
                 break
             except HTTPError as exc:
-                raise TelegramAPIError(f"Network error: {exc}") from exc
+                raw_err = ""
+                try:
+                    raw_err = exc.read().decode("utf-8")
+                except Exception:
+                    pass
+
+                description = ""
+                error_code = exc.code
+                parameters: dict[str, Any] = {}
+                if raw_err:
+                    try:
+                        err_payload = json.loads(raw_err)
+                        if isinstance(err_payload, dict):
+                            description = str(err_payload.get("description") or "")
+                            error_code = int(err_payload.get("error_code") or exc.code)
+                            parameters = err_payload.get("parameters") or {}
+                    except Exception:
+                        pass
+
+                if not description:
+                    description = f"HTTP Error {exc.code}: {exc.reason}"
+
+                if exc.code == 429:
+                    retry_after = int(parameters.get("retry_after") or retry_delay)
+                    if attempt < retries and retry_after <= 10:
+                        logging.warning(
+                            "Telegram rate limit 429, retry after %ss (attempt %s/%s)",
+                            retry_after,
+                            attempt,
+                            retries,
+                        )
+                        time.sleep(retry_after)
+                        continue
+                elif exc.code in (500, 502, 503, 504):
+                    if attempt < retries:
+                        logging.warning(
+                            "Telegram server error %s, retry in %.0fs (attempt %s/%s)",
+                            exc.code,
+                            retry_delay,
+                            attempt,
+                            retries,
+                        )
+                        time.sleep(retry_delay)
+                        continue
+
+                raise TelegramAPIError(
+                    f"Telegram API error {error_code}: {description}",
+                    error_code=error_code,
+                    description=description,
+                    parameters=parameters,
+                ) from exc
             except (URLError, TimeoutError) as exc:
                 last_error = exc
                 if attempt < retries:
@@ -63,7 +122,15 @@ class TelegramAPI:
 
         payload = json.loads(raw)
         if not payload.get("ok"):
-            raise TelegramAPIError(str(payload))
+            description = str(payload.get("description") or payload)
+            error_code = payload.get("error_code")
+            parameters = payload.get("parameters") or {}
+            raise TelegramAPIError(
+                f"Telegram API error {error_code}: {description}",
+                error_code=error_code,
+                description=description,
+                parameters=parameters,
+            )
         return payload["result"]
 
     def call(self, method: str, payload: dict[str, Any] | None = None) -> Any:

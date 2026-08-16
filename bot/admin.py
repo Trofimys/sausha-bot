@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import os
 from html import escape
 from typing import Any
 
-from bot.db import Database
 from bot.catalog import get_server_map, load_server_catalog
+from bot.db import Database
 from bot.proxy6 import Proxy6Client
+
+
+def get_webapp_url() -> str:
+    url = os.getenv("WEBAPP_URL", "").strip()
+    if url.startswith("https://"):
+        return url
+    return ""
 
 
 def admin_keyboard(show_free_buy: bool = False) -> dict[str, Any]:
@@ -16,21 +24,24 @@ def admin_keyboard(show_free_buy: bool = False) -> dict[str, Any]:
         ],
         [
             {"text": "Список прокси", "callback_data": "admin:proxy_list"},
-            {"text": "Прокси", "callback_data": "admin:proxies"},
+            {"text": "Прокси (Proxy6)", "callback_data": "admin:proxies"},
         ],
         [
             {"text": "Каталог покупки", "callback_data": "admin:buy_catalog"},
-        ],
-        [
             {"text": "Настройка серверов", "callback_data": "admin:servers"},
         ],
         [
             {"text": "Промокоды", "callback_data": "admin:promocodes"},
-        ],
-        [
             {"text": "🚫 Блокировки", "callback_data": "admin:blocks"},
         ],
+        [
+            {"text": "📦 Пул прокси", "callback_data": "admin:pool"},
+            {"text": "📢 Рассылка", "callback_data": "admin:broadcast"},
+        ],
     ]
+    webapp_url = get_webapp_url()
+    if webapp_url:
+        rows.insert(0, [{"text": "👑 Админ-панель (Mini App)", "web_app": {"url": webapp_url}}])
     if show_free_buy:
         rows.append(
             [{"text": "🎁 Купить прокси (бесплатно)", "callback_data": "admin:freebuy"}]
@@ -54,25 +65,28 @@ def free_buy_servers_keyboard() -> dict[str, Any]:
     return {"inline_keyboard": rows}
 
 
-def start_keyboard() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "Купить прокси",
-                    "callback_data": "user:buy_proxy",
-                    "style": "primary",
-                },
-            ],
-            [
-                {"text": "Профиль", "callback_data": "user:profile"},
-                {"text": "Поддержка", "url": "https://t.me/tpofa"},
-            ],
-            [
-                {"text": "Получить прокси", "callback_data": "user:get_proxy"},
-            ],
-        ]
-    }
+def start_keyboard(webapp_url: str | None = None) -> dict[str, Any]:
+    url = webapp_url or get_webapp_url()
+    rows: list[list[dict[str, Any]]] = []
+    if url:
+        rows.append([{"text": "✨ Открыть WebApp Маркет", "web_app": {"url": url}}])
+    rows.extend([
+        [
+            {
+                "text": "Купить прокси",
+                "callback_data": "user:buy_proxy",
+                "style": "primary",
+            },
+        ],
+        [
+            {"text": "Профиль", "callback_data": "user:profile"},
+            {"text": "Поддержка", "url": "https://t.me/tpofa"},
+        ],
+        [
+            {"text": "Купленные прокси", "callback_data": "user:purchased_proxies"},
+        ],
+    ])
+    return {"inline_keyboard": rows}
 
 
 def proxy_server_keyboard() -> dict[str, Any]:
@@ -109,24 +123,27 @@ def purchased_proxies_keyboard() -> dict[str, Any]:
     }
 
 
-def profile_keyboard() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "Пополнить баланс", "callback_data": "user:top_up"},
-            ],
-            [
-                {"text": "Купленные прокси", "callback_data": "user:purchased_proxies"},
-                {"text": "Реферальная система", "callback_data": "user:referral_system"},
-            ],
-            [
-                {"text": "Применить промокод", "callback_data": "user:apply_promocode"},
-            ],
-            [
-                {"text": "Назад", "callback_data": "user:back_to_start"},
-            ],
-        ]
-    }
+def profile_keyboard(webapp_url: str | None = None) -> dict[str, Any]:
+    url = webapp_url or get_webapp_url()
+    rows: list[list[dict[str, Any]]] = []
+    if url:
+        rows.append([{"text": "🌐 Личный кабинет (Mini App)", "web_app": {"url": url}}])
+    rows.extend([
+        [
+            {"text": "Пополнить баланс", "callback_data": "user:top_up"},
+        ],
+        [
+            {"text": "Купленные прокси", "callback_data": "user:purchased_proxies"},
+            {"text": "Реферальная система", "callback_data": "user:referral_system"},
+        ],
+        [
+            {"text": "Применить промокод", "callback_data": "user:apply_promocode"},
+        ],
+        [
+            {"text": "Назад", "callback_data": "user:back_to_start"},
+        ],
+    ])
+    return {"inline_keyboard": rows}
 
 
 def referral_keyboard() -> dict[str, Any]:
@@ -234,7 +251,7 @@ def yookassa_invoice_keyboard(pay_url: str, invoice_id: str, method: str) -> dic
 
 def build_profile_text(user: dict[str, Any]) -> str:
     username = user.get("username")
-    username_text = f"@{escape(username)}" if username else "не указан"
+    username_text = f"@{escape(str(username))}" if username else "не указан"
     balance = float(user.get("balance_rub") or 0.0)
     discount_percent = float(user.get("active_discount_percent") or 0.0)
     discount_code = str(user.get("active_discount_code") or "").strip()
@@ -253,8 +270,24 @@ def build_profile_text(user: dict[str, Any]) -> str:
     )
 
 
+def top_up_prompt_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "Назад", "callback_data": "user:profile"}],
+        ]
+    }
+
+
+def promocode_prompt_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "Назад", "callback_data": "user:profile"}],
+        ]
+    }
+
+
 def build_top_up_prompt_text() -> str:
-    return "Введите сумму пополнения\n\n(минимум 10 ₽)"
+    return "Введите сумму пополнения\n\n(минимум 10 ₽, максимум 500 000 ₽)"
 
 
 def build_top_up_payment_text(amount: float) -> str:
@@ -307,6 +340,18 @@ def build_crypto_invoice_text(title: str, amount: float) -> str:
         f"<b>{escape(title)}</b>\n\n"
         f"Сумма: {amount:.2f} ₽\n"
         "Для оплаты нажмите кнопку ниже, затем вернитесь и нажмите «Проверить оплату»."
+    )
+
+
+def build_new_proxy_issued_text(server_name: str, proxy: dict[str, Any]) -> str:
+    return (
+        "🎉 <b>Прокси успешно выдан и готов к работе!</b>\n\n"
+        f"<b>Сервер:</b> {escape(str(server_name))}\n"
+        f"🌐 <b>IP:</b> <code>{escape(str(proxy.get('host', 'n/a')))}</code>\n"
+        f"🔌 <b>Порт:</b> <code>{escape(str(proxy.get('port', 'n/a')))}</code>\n"
+        f"👤 <b>Логин:</b> <code>{escape(str(proxy.get('login', 'n/a')))}</code>\n"
+        f"🔑 <b>Пароль:</b> <code>{escape(str(proxy.get('password', 'n/a')))}</code>\n\n"
+        "<i>Данные также всегда доступны в разделе «Купленные прокси».</i>"
     )
 
 
@@ -420,7 +465,7 @@ def build_privacy_policy_text() -> str:
 
 def build_profile_alert_text(user: dict[str, Any]) -> str:
     username = user.get("username")
-    username_text = f"@{username}" if username else "не указан"
+    username_text = f"@{escape(str(username))}" if username else "не указан"
     return (
         "Профиль\n"
         f"Юзернейм: {username_text}\n"
@@ -542,10 +587,10 @@ def build_blocks_text(items: list[dict[str, str | int | None]]) -> str:
         elif name_parts:
             who = escape(name_parts)
         else:
-            who = str(user_id)
+            who = escape(str(user_id))
         reason = str(item.get("reason") or "").strip()
         reason_text = f" — {escape(reason)}" if reason else ""
-        lines.append(f"• {who} (<code>{user_id}</code>){reason_text}")
+        lines.append(f"• {who} (<code>{escape(str(user_id))}</code>){reason_text}")
     return "\n".join(lines)
 
 
@@ -564,6 +609,97 @@ def build_block_prompt_text(action: str) -> str:
     )
 
 
+# --- Пул прокси ---
+
+def pool_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "➕ Добавить прокси", "callback_data": "admin:pool:add"},
+                {"text": "🗑 Удалить прокси", "callback_data": "admin:pool:remove"},
+            ],
+            [
+                {"text": "🔄 Обновить", "callback_data": "admin:pool"},
+                {"text": "Назад", "callback_data": "admin:account"},
+            ],
+        ]
+    }
+
+
+def build_pool_text(stats: dict[str, Any], items: list[dict[str, Any]]) -> str:
+    lines = [
+        "<b>Локальный пул прокси</b>",
+        f"Всего в пуле: <code>{stats.get('total', 0)}</code>",
+        f"Свободно: <code>{stats.get('available', 0)}</code>",
+        f"Выдано: <code>{stats.get('assigned', 0)}</code>",
+        "",
+    ]
+    by_server = stats.get("by_server", {})
+    if by_server:
+        lines.append("<b>По серверам:</b>")
+        for s_code, s_stat in by_server.items():
+            lines.append(f"• <code>{escape(str(s_code))}</code>: {s_stat.get('available', 0)} свободно из {s_stat.get('total', 0)}")
+        lines.append("")
+
+    lines.append("<b>Последние добавленные:</b>")
+    if not items:
+        lines.append("Пул пуст.")
+    else:
+        for item in items[:10]:
+            status_badge = "🟢" if item.get("status") == "available" else "🔴"
+            lines.append(
+                f"• ID <code>{escape(str(item.get('id')))}</code> [{escape(str(item.get('server_code')))}] "
+                f"{status_badge} <code>{escape(str(item.get('host')))}:{escape(str(item.get('port')))}</code>"
+            )
+    return "\n".join(lines)
+
+
+def build_pool_add_prompt_text() -> str:
+    return (
+        "<b>Добавление прокси в пул</b>\n\n"
+        "Отправьте строку или список строк в формате:\n"
+        "<code>server_code host:port:login:password</code>\n"
+        "или без логина:\n"
+        "<code>server_code host:port</code>\n\n"
+        "Пример:\n"
+        "<code>holyworld 1.2.3.4:8000:user:pass</code>\n"
+        "<code>funtime 5.6.7.8:9000</code>"
+    )
+
+
+def build_pool_remove_prompt_text() -> str:
+    return "Введите ID прокси для удаления из пула (например: <code>5</code>)."
+
+
+# --- Рассылка ---
+
+def broadcast_confirm_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Начать рассылку", "callback_data": "admin:broadcast:confirm"},
+                {"text": "❌ Отмена", "callback_data": "admin:account"},
+            ],
+        ]
+    }
+
+
+def build_broadcast_prompt_text() -> str:
+    return (
+        "<b>Массовая рассылка</b>\n\n"
+        "Отправьте сообщение для рассылки всем активным пользователям бота.\n"
+        "Поддерживается HTML-разметка (<b>жирный</b>, <i>курсив</i>, <code>код</code>, ссылки)."
+    )
+
+
+def build_broadcast_preview_text(message_text: str, total_users: int) -> str:
+    return (
+        f"<b>Предпросмотр рассылки (получателей: {total_users}):</b>\n\n"
+        f"{message_text}\n\n"
+        "<i>Подтвердите отправку сообщения всем пользователям:</i>"
+    )
+
+
 def is_admin(user_id: int, admin_ids: set[int]) -> bool:
     return user_id in admin_ids
 
@@ -577,7 +713,7 @@ def display_name(record: dict[str, str | int | None]) -> str:
     username = record.get("username")
     if username:
         return f"@{escape(str(username))}"
-    return str(record["user_id"])
+    return escape(str(record["user_id"]))
 
 
 def build_account_text(
@@ -593,12 +729,12 @@ def build_account_text(
     else:
         balance = proxy6_info.get("balance", "n/a")
         currency = proxy6_info.get("currency", "")
-        proxy_line = f"Proxy6: подключен, баланс {balance} {currency}".strip()
+        proxy_line = f"Proxy6: подключен, баланс {escape(str(balance))} {escape(str(currency))}".strip()
 
     return (
         "<b>Админка</b>\n"
         f"Бот: @{escape(bot_info.get('username') or 'without_username')}\n"
-        f"ID бота: <code>{bot_info['id']}</code>\n"
+        f"ID бота: <code>{escape(str(bot_info.get('id', '')))}</code>\n"
         f"Админов: <code>{len(admin_ids)}</code>\n"
         f"{proxy_line}"
     )
@@ -618,7 +754,7 @@ def build_users_text(database: Database) -> str:
         return "\n".join(lines)
 
     for record in stats.last_users:
-        lines.append(f"• {display_name(record)} - <code>{record['user_id']}</code>")
+        lines.append(f"• {display_name(record)} - <code>{escape(str(record['user_id']))}</code>")
     return "\n".join(lines)
 
 
@@ -634,7 +770,7 @@ def build_proxies_text(proxy6_client: Proxy6Client) -> str:
         return "<b>Прокси</b>\nСписок пуст."
 
     lines = [
-        "<b>Прокси</b>",
+        "<b>Прокси (Proxy6)</b>",
         f"Всего: <code>{len(proxy_list)}</code>",
         "",
     ]

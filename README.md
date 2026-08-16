@@ -46,6 +46,8 @@ cd sausha-bot-main; python main.py  # только сауша-бот
 | `ADMIN_IDS` | да | ID админов через запятую |
 | `PROXY6_API_KEY` | нет | ключ Proxy6 (без него покупка прокси не работает) |
 | `CRYPTO_PAY_TOKEN` | нет | токен CryptoBot для оплаты |
+| `YOOKASSA_SHOP_ID` | нет | Shop ID магазина ЮKassa для оплаты картой / СБП |
+| `YOOKASSA_SECRET_KEY` | нет | Секретный ключ API ЮKassa |
 | `DB_PATH` | нет | путь к SQLite (по умолчанию `data/bot.sqlite3`) |
 | `START_IMAGE_PATH`, `PROFILE_IMAGE_PATH`, `TOP_UP_IMAGE_PATH` | нет | картинки экранов |
 

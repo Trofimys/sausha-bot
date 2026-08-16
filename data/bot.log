@@ -1,0 +1,145 @@
+2026-08-16 16:54:58,147 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 16:55:01,473 INFO Bot started as @testproxy_iii_bot
+2026-08-16 16:56:02,487 INFO Message update: chat_id=7810494142 text=/start
+2026-08-16 16:56:03,385 ERROR Failed to process update 693700641
+Traceback (most recent call last):
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 44, in _read_json
+    with urlopen(request, timeout=timeout) as response:
+         ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 493, in open
+    response = meth(req, response)
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 602, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 531, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 464, in _call_chain
+    result = func(*args)
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 611, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 400: Bad Request
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 119, in run
+    self.process_update(update)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 140, in process_update
+    self.process_message(message, text)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 163, in process_message
+    self.send_start(message)
+    ~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 285, in send_start
+    self.telegram.edit_message_reply_markup(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        chat_id=chat_id,
+        ^^^^^^^^^^^^^^^^
+        message_id=sent_message["message_id"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        reply_markup=start_keyboard(),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 178, in edit_message_reply_markup
+    return self.call("editMessageReplyMarkup", payload)
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 82, in call
+    return self._read_json(request, timeout=30)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 48, in _read_json
+    raise TelegramAPIError(f"Network error: {exc}") from exc
+bot.telegram_api.TelegramAPIError: Network error: HTTP Error 400: Bad Request
+2026-08-16 16:57:00,135 INFO Message update: chat_id=7810494142 text=/admin
+2026-08-16 17:00:52,770 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 17:00:53,324 INFO Bot started as @testproxy_iii_bot
+2026-08-16 17:01:01,317 INFO Message update: chat_id=7810494142 text=/start
+2026-08-16 17:01:01,949 ERROR Failed to process update 693700643
+Traceback (most recent call last):
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 44, in _read_json
+    with urlopen(request, timeout=timeout) as response:
+         ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 493, in open
+    response = meth(req, response)
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 602, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 531, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 464, in _call_chain
+    result = func(*args)
+  File "C:\Users\salyg\AppData\Local\Python\pythoncore-3.14-64\Lib\urllib\request.py", line 611, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 400: Bad Request
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 119, in run
+    self.process_update(update)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 140, in process_update
+    self.process_message(message, text)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 163, in process_message
+    self.send_start(message)
+    ~~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\proxy_bot.py", line 280, in send_start
+    self.telegram.send_photo(
+    ~~~~~~~~~~~~~~~~~~~~~~~~^
+        chat_id=chat_id,
+        ^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        reply_markup=start_keyboard(),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 323, in send_photo
+    result = self._upload_photo(chat_id, photo_path, caption, reply_markup)
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 401, in _upload_photo
+    return self._read_json(request, timeout=30)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\salyg\OneDrive\Desktop\sausha-bot-main\bot\telegram_api.py", line 48, in _read_json
+    raise TelegramAPIError(f"Network error: {exc}") from exc
+bot.telegram_api.TelegramAPIError: Network error: HTTP Error 400: Bad Request
+2026-08-16 17:03:14,863 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 17:03:15,504 INFO Bot started as @testproxy_iii_bot
+2026-08-16 17:03:36,575 INFO Callback update: user_id=7810494142 data=user:profile
+2026-08-16 17:03:42,556 INFO Callback update: user_id=7810494142 data=user:back_to_start
+2026-08-16 17:08:03,284 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 17:08:03,892 INFO Bot started as @testproxy_iii_bot
+2026-08-16 17:09:30,084 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 17:09:30,641 INFO Bot started as @testproxy_iii_bot
+2026-08-16 17:13:51,343 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 17:13:51,907 INFO Bot started as @testproxy_iii_bot
+2026-08-16 17:18:06,749 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:06,749 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:06,754 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:06,759 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:06,764 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:51,665 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:51,665 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:51,678 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:51,689 INFO Message update: chat_id=1001 text=
+2026-08-16 17:18:51,700 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:10,017 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:10,017 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:10,030 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:10,046 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:10,061 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:23,450 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:23,450 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:23,461 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:23,472 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:23,483 INFO Message update: chat_id=1001 text=
+2026-08-16 17:19:59,529 INFO RENDER_EXTERNAL_URL не задан — keep-alive отключён
+2026-08-16 17:20:00,086 INFO Bot started as @testproxy_iii_bot

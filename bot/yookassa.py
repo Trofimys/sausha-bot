@@ -55,16 +55,47 @@ class YooKassaClient:
                 json=payload,
                 timeout=30,
             )
+            if response.status_code >= 400:
+                raise YooKassaError(f"HTTP {response.status_code}: {response.text}")
+            parsed = json.loads(response.text)
+            if not isinstance(parsed, dict):
+                raise YooKassaError("Unexpected response")
+            return parsed
         except requests.RequestException as exc:
-            raise YooKassaError(str(exc)) from exc
+            # Fallback к http.client с OP_IGNORE_UNEXPECTED_EOF для совместимости
+            # с OpenSSL 3.0 / Python 3.12+ на разных ОС при закрытии TLS соединения.
+            try:
+                import base64
+                import http.client
+                import ssl
 
-        if response.status_code >= 400:
-            raise YooKassaError(f"HTTP {response.status_code}: {response.text}")
-
-        parsed = json.loads(response.text)
-        if not isinstance(parsed, dict):
-            raise YooKassaError("Unexpected response")
-        return parsed
+                ctx = ssl.create_default_context()
+                if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+                    ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+                conn = http.client.HTTPSConnection("api.yookassa.ru", 443, context=ctx, timeout=30)
+                auth_str = base64.b64encode(f"{self.shop_id}:{self.secret_key}".encode()).decode()
+                req_headers = {
+                    "Authorization": f"Basic {auth_str}",
+                    "Content-Type": "application/json",
+                    "Connection": "close",
+                }
+                if idempotence_key:
+                    req_headers["Idempotence-Key"] = idempotence_key
+                body_data = json.dumps(payload) if payload is not None else None
+                conn.request(method, f"/v3{path}", body=body_data, headers=req_headers)
+                resp = conn.getresponse()
+                resp_text = resp.read().decode("utf-8")
+                conn.close()
+                if resp.status >= 400:
+                    raise YooKassaError(f"HTTP {resp.status}: {resp_text}")
+                parsed = json.loads(resp_text)
+                if not isinstance(parsed, dict):
+                    raise YooKassaError("Unexpected response")
+                return parsed
+            except YooKassaError:
+                raise
+            except Exception:
+                raise YooKassaError(str(exc)) from exc
 
     def create_payment(
         self,
@@ -81,9 +112,8 @@ class YooKassaClient:
             "description": description[:128],
             "metadata": {"payload": payload},
         }
-        method_type = self.METHOD_TYPES.get(method or "")
-        if method_type:
-            body["payment_method_data"] = {"type": method_type}
+        if method and method in self.METHOD_TYPES:
+            body["payment_method_data"] = {"type": self.METHOD_TYPES[method]}
 
         return self._request(
             "POST",

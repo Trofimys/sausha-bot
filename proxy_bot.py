@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -11,24 +13,32 @@ from urllib.request import urlopen
 
 from bot.admin import (
     admin_keyboard,
+    blocks_keyboard,
+    broadcast_confirm_keyboard,
     build_account_text,
+    build_block_prompt_text,
+    build_blocks_text,
+    build_broadcast_preview_text,
+    build_broadcast_prompt_text,
     build_buy_catalog_countries_text,
     build_buy_catalog_country_text,
     build_buy_catalog_versions_text,
-    build_buy_proxy_agreement_text,
     build_buy_payment_summary_text,
+    build_buy_proxy_agreement_text,
     build_crypto_invoice_text,
-    build_block_prompt_text,
-    build_blocks_text,
+    build_new_proxy_issued_text,
     build_offer_text,
-    build_promocode_create_prompt_text,
-    build_promocodes_text,
-    build_purchased_proxies_text,
+    build_pool_add_prompt_text,
+    build_pool_remove_prompt_text,
+    build_pool_text,
     build_privacy_policy_text,
     build_profile_text,
-    build_referral_text,
-    build_proxy_list_text,
+    build_promocode_create_prompt_text,
+    build_promocodes_text,
     build_proxies_text,
+    build_proxy_list_text,
+    build_purchased_proxies_text,
+    build_referral_text,
     build_refund_policy_text,
     build_server_countries_text,
     build_server_price_prompt_text,
@@ -38,16 +48,17 @@ from bot.admin import (
     build_top_up_payment_text,
     build_top_up_prompt_text,
     build_users_text,
+    buy_agreement_keyboard,
     buy_catalog_countries_keyboard,
     buy_catalog_country_keyboard,
     buy_catalog_versions_keyboard,
-    buy_agreement_keyboard,
-    blocks_keyboard,
     crypto_invoice_keyboard,
     free_buy_servers_keyboard,
     is_admin,
     payment_methods_keyboard,
+    pool_keyboard,
     profile_keyboard,
+    promocode_prompt_keyboard,
     promocodes_keyboard,
     proxy_server_keyboard,
     purchased_proxies_keyboard,
@@ -57,6 +68,7 @@ from bot.admin import (
     server_versions_keyboard,
     servers_keyboard,
     start_keyboard,
+    top_up_prompt_keyboard,
     yookassa_invoice_keyboard,
 )
 from bot.catalog import get_server_map, update_server_item
@@ -106,6 +118,22 @@ class BotApp:
         self.pending_admin_block_actions: dict[int, str] = {}
         # user_id админа -> server_code: ждём новую цену для сервера.
         self.pending_admin_price_servers: dict[int, str] = {}
+        # user_id админа -> "add" | "remove": ждём данные для пула прокси.
+        self.pending_admin_pool_actions: dict[int, str] = {}
+        # user_id админа -> draft_text: ждём текст рассылки или подтверждения.
+        self.pending_admin_broadcast_drafts: dict[int, str] = {}
+        # Блокировка от повторных параллельных кликов в UI
+        self._action_lock = threading.Lock()
+        self._in_flight_users: set[int] = set()
+
+    def _clear_user_pending_states(self, user_id: int) -> None:
+        self.pending_top_up_amount_users.pop(user_id, None)
+        self.pending_user_promocode_messages.pop(user_id, None)
+        self.pending_admin_promocode_types.pop(user_id, None)
+        self.pending_admin_block_actions.pop(user_id, None)
+        self.pending_admin_price_servers.pop(user_id, None)
+        self.pending_admin_pool_actions.pop(user_id, None)
+        self.pending_admin_broadcast_drafts.pop(user_id, None)
 
     def run(self) -> None:
         self.telegram.delete_webhook(drop_pending_updates=True)
@@ -121,91 +149,114 @@ class BotApp:
                         logging.exception(
                             "Failed to process update %s", update.get("update_id")
                         )
-                    # Сдвигаем offset только после попытки обработки: если сеть
-                    # моргнула и апдейт упал, мы уже залогировали ошибку и не
-                    # хотим зациклиться на нём — но и вся пачка не теряется.
-                    self.offset = update["update_id"] + 1
+                    update_id = update.get("update_id")
+                    if update_id is not None:
+                        self.offset = int(update_id) + 1
             except Exception as exc:
                 logging.exception("Polling loop failed: %s", exc)
                 time.sleep(3)
 
     def process_update(self, update: dict[str, Any]) -> None:
+        if not isinstance(update, dict):
+            return
         message = update.get("message")
         callback = update.get("callback_query")
 
-        if message:
+        if message and isinstance(message, dict):
             text = str(message.get("text") or "").strip()
-            chat_id = message.get("chat", {}).get("id")
+            chat_id = message.get("chat", {}).get("id") if isinstance(message.get("chat"), dict) else None
             logging.info("Message update: chat_id=%s text=%s", chat_id, text)
             self.process_message(message, text)
             return
 
-        if callback:
+        if callback and isinstance(callback, dict):
             data = str(callback.get("data") or "")
-            user_id = callback.get("from", {}).get("id")
+            user_id = callback.get("from", {}).get("id") if isinstance(callback.get("from"), dict) else None
             logging.info("Callback update: user_id=%s data=%s", user_id, data)
             self.process_callback(callback, data)
 
     def process_message(self, message: dict[str, Any], text: str) -> None:
         user = message.get("from")
-        if user:
+        if user and isinstance(user, dict) and "id" in user:
+            uid = int(user["id"])
             self.database.upsert_user(
-                user_id=user["id"],
+                user_id=uid,
                 username=user.get("username"),
                 first_name=user.get("first_name"),
                 last_name=user.get("last_name"),
                 is_bot=bool(user.get("is_bot", False)),
             )
-            if self._is_blocked(int(user["id"])):
+            if self._is_blocked(uid):
                 return
 
+        # Любые команды сбрасывают текущее состояние ожидания текста
         if text == "/start":
+            if user and isinstance(user, dict) and "id" in user:
+                self._clear_user_pending_states(int(user["id"]))
             self.send_start(message)
             return
         if text.startswith("/start "):
+            if user and isinstance(user, dict) and "id" in user:
+                self._clear_user_pending_states(int(user["id"]))
             self.send_start_payload(message, text)
             return
         if text == "/profile":
+            if user and isinstance(user, dict) and "id" in user:
+                self._clear_user_pending_states(int(user["id"]))
             self.send_profile(message)
             return
         if text == "/admin":
+            if user and isinstance(user, dict) and "id" in user:
+                self._clear_user_pending_states(int(user["id"]))
             self.send_admin(message)
             return
+        if text.lower() in {"/cancel", "/stop", "отмена", "/отмена"}:
+            if user and isinstance(user, dict) and "id" in user:
+                self._clear_user_pending_states(int(user["id"]))
+            self.telegram.send_message(
+                chat_id=self._chat_id(message),
+                text="Действие отменено.",
+                reply_markup=start_keyboard(),
+            )
+            return
 
-        if user and user["id"] in self.pending_admin_price_servers:
+        if user and user.get("id") in self.pending_admin_broadcast_drafts:
+            self.process_admin_broadcast_input(message, text)
+            return
+
+        if user and user.get("id") in self.pending_admin_pool_actions:
+            self.process_admin_pool_input(message, text)
+            return
+
+        if user and user.get("id") in self.pending_admin_price_servers:
             self.process_admin_price_input(message, text)
             return
 
-        if user and user["id"] in self.pending_admin_block_actions:
+        if user and user.get("id") in self.pending_admin_block_actions:
             self.process_admin_block_input(message, text)
             return
 
-        if user and user["id"] in self.pending_admin_promocode_types:
+        if user and user.get("id") in self.pending_admin_promocode_types:
             self.process_admin_promocode_input(message, text)
             return
 
-        if user and user["id"] in self.pending_top_up_amount_users:
+        if user and user.get("id") in self.pending_top_up_amount_users:
             self.process_top_up_amount(message, text)
             return
 
-        if user and user["id"] in self.pending_user_promocode_messages:
+        if user and user.get("id") in self.pending_user_promocode_messages:
             self.process_user_promocode_input(message, text)
             return
 
     def process_callback(self, callback: dict[str, Any], data: str) -> None:
-        # Любое нажатие кнопки отменяет незавершённый ввод текста (сумма/промокод),
-        # чтобы следующее случайное сообщение не перехватывалось этими флоу.
-        # Сами промпт-обработчики выставляют своё состояние уже после этого сброса.
         user = callback.get("from")
-        if user:
+        if user and isinstance(user, dict) and "id" in user:
             uid = int(user["id"])
             if self._is_blocked(uid):
                 self.answer_callback(callback, "Вы заблокированы.", show_alert=True)
                 return
-            self.pending_top_up_amount_users.pop(uid, None)
-            self.pending_user_promocode_messages.pop(uid, None)
-            # Не сбрасываем pending-блокировку здесь: admin:blocks:add/remove
-            # сами выставляют её сразу после этого хендлера.
+            # Любой клик по инлайн-кнопке сбрасывает незавершённый ввод текста для пользователя.
+            self._clear_user_pending_states(uid)
 
         if data == "user:profile":
             self.answer_callback(callback, "Профиль открыт")
@@ -277,14 +328,10 @@ class BotApp:
         start_image_path = self.settings.start_image_path
 
         if start_image_path and start_image_path.exists():
-            sent_message = self.telegram.send_photo(
+            self.telegram.send_photo(
                 chat_id=chat_id,
                 photo_path=start_image_path,
                 caption=caption,
-            )
-            self.telegram.edit_message_reply_markup(
-                chat_id=chat_id,
-                message_id=sent_message["message_id"],
                 reply_markup=start_keyboard(),
             )
             return
@@ -341,7 +388,7 @@ class BotApp:
             logging.info("Referral linked: user=%s referrer=%s", user["id"], referrer_id)
             try:
                 inviter_name = user.get("username")
-                who = f"@{inviter_name}" if inviter_name else str(user["id"])
+                who = f"@{escape(inviter_name)}" if inviter_name else escape(str(user["id"]))
                 self.telegram.send_message(
                     chat_id=referrer_id,
                     text=f"По вашей ссылке присоединился новый пользователь: {who}",
@@ -361,12 +408,14 @@ class BotApp:
                 chat_id=self._chat_id(message),
                 photo_path=profile_image_path,
                 caption=profile_text,
+                reply_markup=profile_keyboard(),
             )
             return
 
         self.telegram.send_message(
             chat_id=self._chat_id(message),
             text=profile_text,
+            reply_markup=profile_keyboard(),
         )
 
     def send_profile_from_callback(self, callback: dict[str, Any]) -> None:
@@ -446,11 +495,13 @@ class BotApp:
         if not message or not user:
             return
 
-        self.pending_top_up_amount_users[int(user["id"])] = int(message["message_id"])
-        self.pending_user_promocode_messages.pop(int(user["id"]), None)
+        uid = int(user["id"])
+        self.pending_top_up_amount_users[uid] = int(message["message_id"])
+        self.pending_user_promocode_messages.pop(uid, None)
         self.edit_message_content(
             message=message,
             text=build_top_up_prompt_text(),
+            reply_markup=top_up_prompt_keyboard(),
             photo_path=self.settings.top_up_image_path,
         )
 
@@ -460,11 +511,13 @@ class BotApp:
         if not message or not user:
             return
 
-        self.pending_user_promocode_messages[int(user["id"])] = int(message["message_id"])
-        self.pending_top_up_amount_users.pop(int(user["id"]), None)
+        uid = int(user["id"])
+        self.pending_user_promocode_messages[uid] = int(message["message_id"])
+        self.pending_top_up_amount_users.pop(uid, None)
         self.edit_message_content(
             message=message,
             text="Введите промокод одним сообщением.",
+            reply_markup=promocode_prompt_keyboard(),
             photo_path=self.settings.top_up_image_path,
         )
 
@@ -504,17 +557,18 @@ class BotApp:
             self.answer_callback(callback, "Нет доступных бесплатных прокси.", show_alert=True)
             return
 
-        ok, error_text = self._buy_and_store_proxy(user_id, server_code)
-        if not ok:
+        ok, error_text, proxy_info = self._buy_and_store_proxy(user_id, server_code)
+        if not ok or proxy_info is None:
             # Возвращаем кредит, раз прокси выдать не удалось.
             self.database.add_free_proxy_credits(user_id, 1)
             self.answer_callback(callback, f"{error_text} Бесплатный прокси возвращён.", show_alert=True)
             return
 
         self.answer_callback(callback, "Бесплатный прокси выдан!")
+        server_name = str(proxy_info.get("server_name") or server_item["name"])
         self.edit_message_content(
             message=message,
-            text=build_purchased_proxies_text(self.database.get_purchased_proxies(user_id)),
+            text=build_new_proxy_issued_text(server_name, proxy_info),
             reply_markup=purchased_proxies_keyboard(),
         )
 
@@ -534,21 +588,21 @@ class BotApp:
         self.pending_user_promocode_messages.pop(int(user["id"]), None)
         success, status_text, promo = self.database.redeem_promocode(int(user["id"]), code)
         if not success:
-            self.telegram.send_message(chat_id=self._chat_id(message), text=status_text)
+            self.telegram.send_message(chat_id=self._chat_id(message), text=escape(status_text))
             return
 
         reward_type = str((promo or {}).get("reward_type") or "")
         reward_value = float((promo or {}).get("reward_value") or 0.0)
         if reward_type == "balance":
-            response_text = f"Промокод активирован. Баланс пополнен на {reward_value:.2f} ₽."
+            response_text = f"Промокод <code>{escape(code)}</code> активирован. Баланс пополнен на {reward_value:.2f} ₽."
         elif reward_type == "free_proxy":
             credits = max(1, int(reward_value)) if reward_value else 1
             response_text = (
-                f"Промокод активирован. Начислено бесплатных прокси: {credits}.\n"
+                f"Промокод <code>{escape(code)}</code> активирован. Начислено бесплатных прокси: {credits}.\n"
                 "Забрать можно при покупке любого сервера кнопкой «🎁 Забрать бесплатно»."
             )
         else:
-            response_text = f"Промокод активирован. Скидка {reward_value:.0f}% применится к следующей покупке."
+            response_text = f"Промокод <code>{escape(code)}</code> активирован. Скидка {reward_value:.0f}% применится к следующей покупке."
         self.telegram.send_message(chat_id=self._chat_id(message), text=response_text)
 
     def process_top_up_amount(self, message: dict[str, Any], text: str) -> None:
@@ -562,17 +616,32 @@ class BotApp:
         except ValueError:
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
-                text="Введите сумму числом. Минимум 10 ₽.",
+                text="Введите сумму числом. Минимум 10 ₽, максимум 500 000 ₽.",
             )
             return
 
-        if amount < 10:
+        if not math.isfinite(amount) or math.isnan(amount):
+            self.telegram.send_message(
+                chat_id=self._chat_id(message),
+                text="Некорректная сумма пополнения. Введите число.",
+            )
+            return
+
+        if amount < 10.0:
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
                 text="Минимальная сумма пополнения — 10 ₽.",
             )
             return
 
+        if amount > 500_000.0:
+            self.telegram.send_message(
+                chat_id=self._chat_id(message),
+                text="Максимальная сумма пополнения — 500 000 ₽.",
+            )
+            return
+
+        amount = round(amount, 2)
         pending_message_id = self.pending_top_up_amount_users.pop(int(user["id"]), None)
         if pending_message_id is not None:
             self.telegram.edit_message_caption(
@@ -610,21 +679,47 @@ class BotApp:
 
         self.create_cryptobot_invoice(callback, purpose, value)
 
-    def _buy_and_store_proxy(self, user_id: int, server_code: str) -> tuple[bool, str]:
-        """Покупает прокси в Proxy6 по настройкам сервера и сохраняет пользователю.
+    def _buy_and_store_proxy(self, user_id: int, server_code: str) -> tuple[bool, str, dict[str, Any] | None]:
+        """Покупает/выдаёт прокси по настройкам сервера и сохраняет пользователю.
 
-        Возвращает (успех, текст_ошибки). При успехе текст ошибки пустой.
+        Сначала проверяет локальный пул прокси, затем обращается к Proxy6 API.
+        Возвращает (успех, текст_ошибки, данные_прокси). При успехе текст ошибки пустой.
         Баланс здесь НЕ трогается — списание/возврат делает вызывающий код.
         """
         server_item = get_server_map().get(server_code)
         if server_item is None:
-            return False, "Сервер не найден."
+            return False, "Сервер не найден.", None
 
+        # 1. Проверяем локальный пул прокси
+        pool_proxy = self.database.get_available_proxy_from_pool(server_code)
+        if pool_proxy is not None:
+            proxy_id = int(pool_proxy["id"])
+            if self.database.assign_pool_proxy(proxy_id, user_id):
+                proxy_info = {
+                    "server_code": server_code,
+                    "server_name": server_item["name"],
+                    "host": str(pool_proxy.get("host", "")),
+                    "port": str(pool_proxy.get("port", "")),
+                    "login": str(pool_proxy.get("login", "")),
+                    "password": str(pool_proxy.get("password", "")),
+                }
+                self.database.add_purchased_proxy(
+                    user_id=user_id,
+                    server_code=server_code,
+                    proxy_id=f"pool_{proxy_id}",
+                    host=proxy_info["host"],
+                    port=proxy_info["port"],
+                    login=proxy_info["login"],
+                    password=proxy_info["password"],
+                )
+                return True, "", proxy_info
+
+        # 2. Если в локальном пуле нет — покупаем через Proxy6
         versions = server_item.get("allowed_versions") or []
         countries = server_item.get("allowed_countries") or []
         periods = server_item.get("allowed_periods") or []
         if not versions or not countries:
-            return False, "Сервер не настроен: задайте тип и страну прокси в админке."
+            return False, "Сервер не настроен: задайте тип и страну прокси в админке или пополните пул.", None
 
         version = str(versions[0])
         country = str(countries[0])
@@ -637,9 +732,9 @@ class BotApp:
                 period=period,
                 count=1,
             )
-        except Exception as exc:  # noqa: BLE001 - ошибку отдаём вызывающему
+        except Exception as exc:
             logging.exception("Proxy6 buy failed")
-            return False, f"Ошибка покупки прокси: {exc}"
+            return False, f"Ошибка покупки прокси: {exc}", None
 
         if result.get("status") != "yes":
             error_text = str(
@@ -647,7 +742,7 @@ class BotApp:
                 or result.get("error_id")
                 or "прокси недоступен"
             )
-            return False, f"Не удалось купить прокси: {error_text}"
+            return False, f"Не удалось купить прокси: {error_text}", None
 
         proxy: dict[str, Any] | None = None
         proxy_list = result.get("list")
@@ -658,18 +753,27 @@ class BotApp:
                     break
 
         if proxy is None:
-            return False, "Прокси не получен."
+            return False, "Прокси не получен.", None
+
+        proxy_info = {
+            "server_code": server_code,
+            "server_name": server_item["name"],
+            "host": str(proxy.get("host") or proxy.get("ip") or ""),
+            "port": str(proxy.get("port") or ""),
+            "login": str(proxy.get("user") or ""),
+            "password": str(proxy.get("pass") or ""),
+        }
 
         self.database.add_purchased_proxy(
             user_id=user_id,
             server_code=server_code,
             proxy_id=str(proxy.get("id", "")),
-            host=str(proxy.get("host") or proxy.get("ip") or ""),
-            port=str(proxy.get("port") or ""),
-            login=str(proxy.get("user") or ""),
-            password=str(proxy.get("pass") or ""),
+            host=proxy_info["host"],
+            port=proxy_info["port"],
+            login=proxy_info["login"],
+            password=proxy_info["password"],
         )
-        return True, ""
+        return True, "", proxy_info
 
     def purchase_with_balance(self, callback: dict[str, Any], purpose: str, value: str) -> None:
         message = callback.get("message")
@@ -686,42 +790,53 @@ class BotApp:
             return
 
         user_id = int(user["id"])
-        server_item = get_server_map().get(value)
-        if server_item is None:
-            self.answer_callback(callback, "Сервер не найден.", show_alert=True)
-            return
+        with self._action_lock:
+            if user_id in self._in_flight_users:
+                self.answer_callback(callback, "Операция уже выполняется...", show_alert=True)
+                return
+            self._in_flight_users.add(user_id)
 
-        user_record = self.database.get_user(user_id) or {}
-        base_amount = float(server_item["price_rub"])
-        discount_percent = float(user_record.get("active_discount_percent") or 0.0)
-        amount = self.apply_discount(base_amount, discount_percent)
+        try:
+            server_item = get_server_map().get(value)
+            if server_item is None:
+                self.answer_callback(callback, "Сервер не найден.", show_alert=True)
+                return
 
-        if not self.database.subtract_user_balance(user_id, amount):
-            balance = self.database.get_user_balance(user_id)
-            self.answer_callback(
-                callback,
-                f"Недостаточно средств. Баланс: {balance:.2f} ₽, нужно {amount:.2f} ₽.",
-                show_alert=True,
+            user_record = self.database.get_user(user_id) or {}
+            base_amount = float(server_item["price_rub"])
+            discount_percent = float(user_record.get("active_discount_percent") or 0.0)
+            amount = self.apply_discount(base_amount, discount_percent)
+
+            if not self.database.subtract_user_balance(user_id, amount):
+                balance = self.database.get_user_balance(user_id)
+                self.answer_callback(
+                    callback,
+                    f"Недостаточно средств. Баланс: {balance:.2f} ₽, нужно {amount:.2f} ₽.",
+                    show_alert=True,
+                )
+                return
+
+            ok, error_text, proxy_info = self._buy_and_store_proxy(user_id, value)
+            if not ok or proxy_info is None:
+                self.database.add_user_balance(user_id, amount)
+                self.answer_callback(
+                    callback,
+                    f"{error_text} Средства возвращены на баланс.",
+                    show_alert=True,
+                )
+                return
+
+            self.database.clear_user_discount(user_id)
+            self.answer_callback(callback, "Прокси куплен!")
+            server_name = str(proxy_info.get("server_name") or server_item["name"])
+            self.edit_message_content(
+                message=message,
+                text=build_new_proxy_issued_text(server_name, proxy_info),
+                reply_markup=purchased_proxies_keyboard(),
             )
-            return
-
-        ok, error_text = self._buy_and_store_proxy(user_id, value)
-        if not ok:
-            self.database.add_user_balance(user_id, amount)
-            self.answer_callback(
-                callback,
-                f"{error_text} Средства возвращены на баланс.",
-                show_alert=True,
-            )
-            return
-
-        self.database.clear_user_discount(user_id)
-        self.answer_callback(callback, "Прокси куплен!")
-        self.edit_message_content(
-            message=message,
-            text=build_purchased_proxies_text(self.database.get_purchased_proxies(user_id)),
-            reply_markup=purchased_proxies_keyboard(),
-        )
+        finally:
+            with self._action_lock:
+                self._in_flight_users.discard(user_id)
 
     def create_cryptobot_invoice(self, callback: dict[str, Any], purpose: str, value: str) -> None:
         message = callback.get("message")
@@ -734,7 +849,14 @@ class BotApp:
             return
 
         if purpose == "topup":
-            amount = float(value)
+            try:
+                amount = float(value)
+            except ValueError:
+                self.answer_callback(callback, "Некорректная сумма.", show_alert=True)
+                return
+            if not math.isfinite(amount) or amount < 10.0 or amount > 500_000.0:
+                self.answer_callback(callback, "Некорректная сумма пополнения.", show_alert=True)
+                return
             title = "Пополнение баланса"
             server_code = None
             proxy_id = None
@@ -747,20 +869,12 @@ class BotApp:
             if server_item is None:
                 self.answer_callback(callback, "Сервер не найден.", show_alert=True)
                 return
-            if not (server_item.get("allowed_versions") and server_item.get("allowed_countries")):
-                self.answer_callback(
-                    callback,
-                    "Сервер не настроен: задайте тип и страну прокси в админке.",
-                    show_alert=True,
-                )
-                return
             user_record = self.database.get_user(int(user["id"])) or {}
             base_amount = float(server_item["price_rub"])
             discount_percent = float(user_record.get("active_discount_percent") or 0.0)
             amount = self.apply_discount(base_amount, discount_percent)
             title = f"{server_item['name']} Proxy"
             server_code = value
-            # Прокси покупается персонально ПОСЛЕ подтверждения оплаты, не резервируется по индексу.
             proxy_id = None
             proxy_version = None
             proxy_country = None
@@ -809,26 +923,21 @@ class BotApp:
     def _resolve_payment_target(
         self, callback: dict[str, Any], purpose: str, value: str, user: dict[str, Any]
     ) -> tuple[float, str, str, str | None] | None:
-        """Считает сумму/заголовок/описание/server_code для оплаты.
-
-        Возвращает None и уже отвечает пользователю на callback, если оплатить нельзя.
-        Общая логика для CryptoBot и YooKassa, чтобы суммы и скидки не разъезжались.
-        """
         if purpose == "topup":
-            amount = float(value)
+            try:
+                amount = float(value)
+            except ValueError:
+                self.answer_callback(callback, "Некорректная сумма.", show_alert=True)
+                return None
+            if not math.isfinite(amount) or amount < 10.0 or amount > 500_000.0:
+                self.answer_callback(callback, "Некорректная сумма пополнения.", show_alert=True)
+                return None
             return amount, "Пополнение баланса", f"Пополнение баланса на {amount:.2f} RUB", None
 
         if purpose == "buy":
             server_item = get_server_map().get(value)
             if server_item is None:
                 self.answer_callback(callback, "Сервер не найден.", show_alert=True)
-                return None
-            if not (server_item.get("allowed_versions") and server_item.get("allowed_countries")):
-                self.answer_callback(
-                    callback,
-                    "Сервер не настроен: задайте тип и страну прокси в админке.",
-                    show_alert=True,
-                )
                 return None
             user_record = self.database.get_user(int(user["id"])) or {}
             base_amount = float(server_item["price_rub"])
@@ -875,7 +984,7 @@ class BotApp:
 
         payment_id = str(payment.get("id", ""))
         confirmation = payment.get("confirmation") or {}
-        pay_url = str(confirmation.get("confirmation_url") or "")
+        pay_url = str(confirmation.get("confirmation_url") or confirmation.get("confirmation_data") or "")
         if not payment_id or not pay_url:
             self.answer_callback(callback, "YooKassa не вернула ссылку на оплату.", show_alert=True)
             return
@@ -911,8 +1020,6 @@ class BotApp:
             self.telegram.send_message(chat_id=self._chat_id(message), text="Счет не найден.")
             return
 
-        # Успешно оплаченный счёт нормализуем в статус "paid" после выдачи,
-        # поэтому повторное нажатие ловится здесь и не приводит к двойной выдаче.
         if str(stored["status"]) == "paid":
             self.telegram.send_message(chat_id=self._chat_id(message), text="Оплата уже подтверждена.")
             return
@@ -922,7 +1029,7 @@ class BotApp:
             try:
                 payment = self.yookassa.get_payment(invoice_id)
             except YooKassaError as exc:
-                self.telegram.send_message(chat_id=self._chat_id(message), text=f"Ошибка проверки оплаты: {exc}")
+                self.telegram.send_message(chat_id=self._chat_id(message), text=f"Ошибка проверки оплаты: {escape(str(exc))}")
                 return
             if payment is None:
                 self.telegram.send_message(chat_id=self._chat_id(message), text="Платёж не найден в YooKassa.")
@@ -933,7 +1040,7 @@ class BotApp:
             try:
                 invoice = self.cryptobot.get_invoice(invoice_id)
             except CryptoBotError as exc:
-                self.telegram.send_message(chat_id=self._chat_id(message), text=f"Ошибка проверки оплаты: {exc}")
+                self.telegram.send_message(chat_id=self._chat_id(message), text=f"Ошибка проверки оплаты: {escape(str(exc))}")
                 return
             if invoice is None:
                 self.telegram.send_message(chat_id=self._chat_id(message), text="Счет не найден в CryptoBot.")
@@ -945,10 +1052,11 @@ class BotApp:
         if not is_paid:
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
-                text=f"Оплата не найдена. Текущий статус счета: {status}. Если вы уже оплатили, нажмите проверить еще раз через несколько секунд.",
+                text=f"Оплата не найдена. Текущий статус счета: {escape(status)}. Если вы уже оплатили, нажмите проверить еще раз через несколько секунд.",
             )
             return
 
+        # Помечаем paid
         self.database.update_invoice_status(invoice_id, "paid")
         purpose = str(stored["purpose"])
         user_id = int(stored["user_id"])
@@ -965,17 +1073,18 @@ class BotApp:
 
         if purpose == "buy":
             server_code = str(stored["server_code"] or "")
-            ok, error_text = self._buy_and_store_proxy(user_id, server_code)
-            if not ok:
+            ok, error_text, proxy_info = self._buy_and_store_proxy(user_id, server_code)
+            if not ok or proxy_info is None:
                 self.telegram.send_message(
                     chat_id=self._chat_id(message),
-                    text=f"Оплата подтверждена, но выдать прокси не удалось: {error_text} Напишите в поддержку.",
+                    text=f"Оплата подтверждена, но выдать прокси не удалось: {escape(error_text)} Напишите в поддержку.",
                 )
                 return
             self.database.clear_user_discount(user_id)
+            server_name = str(proxy_info.get("server_name") or server_code)
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
-                text=build_purchased_proxies_text(self.database.get_purchased_proxies(user_id)),
+                text=build_new_proxy_issued_text(server_name, proxy_info),
                 reply_markup=purchased_proxies_keyboard(),
             )
 
@@ -1020,12 +1129,13 @@ class BotApp:
         if not user or not message:
             return
 
-        if not is_admin(user["id"], self.settings.admin_ids):
+        uid = int(user["id"])
+        if not is_admin(uid, self.settings.admin_ids):
             self.answer_callback(callback, "Нет доступа.", show_alert=True)
             return
 
         if data == "admin:freebuy" or data.startswith("admin:freebuy:"):
-            if int(user["id"]) != FREE_BUY_ADMIN_ID:
+            if uid != FREE_BUY_ADMIN_ID:
                 self.answer_callback(callback, "Эта функция недоступна.", show_alert=True)
                 return
             if data == "admin:freebuy":
@@ -1037,16 +1147,16 @@ class BotApp:
                 self.answer_callback(callback)
                 return
             server_code = data.removeprefix("admin:freebuy:")
-            ok, error_text = self._buy_and_store_proxy(int(user["id"]), server_code)
-            if not ok:
+            ok, error_text, proxy_info = self._buy_and_store_proxy(uid, server_code)
+            if not ok or proxy_info is None:
                 self.answer_callback(callback, error_text, show_alert=True)
                 return
             self.answer_callback(callback, "Прокси куплен бесплатно!")
+            server_name = str(proxy_info.get("server_name") or server_code)
             self.edit_message_content(
                 message=message,
-                text=build_purchased_proxies_text(
-                    self.database.get_purchased_proxies(int(user["id"]))
-                ),
+                text=build_new_proxy_issued_text(server_name, proxy_info),
+                reply_markup=purchased_proxies_keyboard(),
             )
             return
 
@@ -1060,22 +1170,48 @@ class BotApp:
             text = build_proxies_text(self.proxy6_client)
         elif data == "admin:proxy_list":
             text = build_proxy_list_text(self.proxy6_client)
+        elif data == "admin:pool":
+            stats = self.database.get_pool_stats()
+            items = self.database.list_pool_proxies(limit=10)
+            self._edit_or_send(
+                message,
+                build_pool_text(stats, items),
+                pool_keyboard(),
+            )
+            self.answer_callback(callback)
+            return
+        elif data in {"admin:pool:add", "admin:pool:remove"}:
+            action = "add" if data.endswith("add") else "remove"
+            self.pending_admin_pool_actions[uid] = action
+            self.answer_callback(callback)
+            prompt_text = build_pool_add_prompt_text() if action == "add" else build_pool_remove_prompt_text()
+            self.telegram.send_message(chat_id=self._chat_id(message), text=prompt_text)
+            return
+        elif data == "admin:broadcast":
+            self.pending_admin_broadcast_drafts[uid] = "waiting_text"
+            self.answer_callback(callback)
+            self.telegram.send_message(chat_id=self._chat_id(message), text=build_broadcast_prompt_text())
+            return
+        elif data == "admin:broadcast:confirm":
+            draft_text = self.pending_admin_broadcast_drafts.pop(uid, None)
+            if not draft_text or draft_text == "waiting_text":
+                self.answer_callback(callback, "Нет сохранённого текста для рассылки.", show_alert=True)
+                return
+            self.answer_callback(callback, "Рассылка запущена!")
+            self.telegram.send_message(
+                chat_id=self._chat_id(message),
+                text="📢 Рассылка запущена в фоновом режиме. По завершении вы получите отчёт.",
+            )
+            threading.Thread(
+                target=self._run_broadcast,
+                args=(uid, draft_text),
+                daemon=True,
+            ).start()
+            return
         elif data == "admin:buy_catalog":
             text = build_buy_catalog_versions_text()
             reply_markup = buy_catalog_versions_keyboard(self.proxy6_client)
-            try:
-                self.telegram.edit_message_text(
-                    chat_id=self._chat_id(message),
-                    message_id=message["message_id"],
-                    text=text,
-                    reply_markup=reply_markup,
-                )
-            except TelegramAPIError:
-                self.telegram.send_message(
-                    chat_id=self._chat_id(message),
-                    text=text,
-                    reply_markup=reply_markup,
-                )
+            self._edit_or_send(message, text, reply_markup)
             self.answer_callback(callback)
             return
         elif data == "admin:servers":
@@ -1092,7 +1228,7 @@ class BotApp:
             if server_item is None:
                 self.answer_callback(callback, "Сервер не найден.", show_alert=True)
                 return
-            self.pending_admin_price_servers[int(user["id"])] = server_code
+            self.pending_admin_price_servers[uid] = server_code
             self.answer_callback(callback, "Жду новую цену")
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
@@ -1168,24 +1304,12 @@ class BotApp:
             return
         elif data == "admin:promocodes":
             text = build_promocodes_text(self.database.get_recent_promocodes())
-            try:
-                self.telegram.edit_message_text(
-                    chat_id=self._chat_id(message),
-                    message_id=message["message_id"],
-                    text=text,
-                    reply_markup=promocodes_keyboard(),
-                )
-            except TelegramAPIError:
-                self.telegram.send_message(
-                    chat_id=self._chat_id(message),
-                    text=text,
-                    reply_markup=promocodes_keyboard(),
-                )
+            self._edit_or_send(message, text, promocodes_keyboard())
             self.answer_callback(callback)
             return
         elif data.startswith("admin:promocodes:create:"):
             reward_type = data.rsplit(":", 1)[-1]
-            self.pending_admin_promocode_types[int(user["id"])] = reward_type
+            self.pending_admin_promocode_types[uid] = reward_type
             self.answer_callback(callback, "Жду промокод")
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
@@ -1202,7 +1326,7 @@ class BotApp:
             return
         elif data in {"admin:blocks:add", "admin:blocks:remove"}:
             action = "add" if data.endswith("add") else "remove"
-            self.pending_admin_block_actions[int(user["id"])] = action
+            self.pending_admin_block_actions[uid] = action
             self.answer_callback(callback, "Жду ID или @username")
             self.telegram.send_message(
                 chat_id=self._chat_id(message),
@@ -1221,19 +1345,7 @@ class BotApp:
             keyboard, total_pages = buy_catalog_countries_keyboard(self.proxy6_client, version, page)
             version_label = self.proxy6_client.VERSION_LABELS.get(version, version)
             text = build_buy_catalog_countries_text(version_label, page, total_pages)
-            try:
-                self.telegram.edit_message_text(
-                    chat_id=self._chat_id(message),
-                    message_id=message["message_id"],
-                    text=text,
-                    reply_markup=keyboard,
-                )
-            except TelegramAPIError:
-                self.telegram.send_message(
-                    chat_id=self._chat_id(message),
-                    text=text,
-                    reply_markup=keyboard,
-                )
+            self._edit_or_send(message, text, keyboard)
             self.answer_callback(callback)
             return
         elif data.startswith("admin:buy_catalog:country:"):
@@ -1242,42 +1354,114 @@ class BotApp:
             country = parts[4] if len(parts) > 4 else "ru"
             text = build_buy_catalog_country_text(self.proxy6_client, version, country)
             keyboard = buy_catalog_country_keyboard(version, country)
-            try:
-                self.telegram.edit_message_text(
-                    chat_id=self._chat_id(message),
-                    message_id=message["message_id"],
-                    text=text,
-                    reply_markup=keyboard,
-                )
-            except TelegramAPIError:
-                self.telegram.send_message(
-                    chat_id=self._chat_id(message),
-                    text=text,
-                    reply_markup=keyboard,
-                )
+            self._edit_or_send(message, text, keyboard)
             self.answer_callback(callback)
             return
         else:
             text = build_users_text(self.database)
 
         admin_markup = admin_keyboard(
-            show_free_buy=int(user["id"]) == FREE_BUY_ADMIN_ID
+            show_free_buy=uid == FREE_BUY_ADMIN_ID
         )
-        try:
-            self.telegram.edit_message_text(
-                chat_id=self._chat_id(message),
-                message_id=message["message_id"],
-                text=text,
-                reply_markup=admin_markup,
-            )
-        except TelegramAPIError:
-            self.telegram.send_message(
-                chat_id=self._chat_id(message),
-                text=text,
-                reply_markup=admin_markup,
-            )
-
+        self._edit_or_send(message, text, admin_markup)
         self.answer_callback(callback)
+
+    def process_admin_pool_input(self, message: dict[str, Any], text: str) -> None:
+        user = message.get("from")
+        if not user:
+            return
+        uid = int(user["id"])
+        action = self.pending_admin_pool_actions.pop(uid, None)
+        if not action or not is_admin(uid, self.settings.admin_ids):
+            return
+
+        if action == "remove":
+            try:
+                proxy_id = int(text.strip())
+            except ValueError:
+                self.telegram.send_message(chat_id=self._chat_id(message), text="ID прокси должен быть числом.")
+                return
+            removed = self.database.remove_proxy_from_pool(proxy_id)
+            status = f"Прокси ID {proxy_id} удалён из пула." if removed else f"Прокси ID {proxy_id} не найден в пуле."
+            self.telegram.send_message(chat_id=self._chat_id(message), text=status, reply_markup=pool_keyboard())
+            return
+
+        # action == "add"
+        lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+        if not lines:
+            self.telegram.send_message(chat_id=self._chat_id(message), text="Список пуст.")
+            return
+
+        added_total = 0
+        failed_total = 0
+        server_map = get_server_map()
+
+        for line in lines:
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2 and parts[0].lower() in server_map:
+                server_code = parts[0].lower()
+                proxy_line = parts[1]
+            else:
+                server_code = "holyworld"
+                proxy_line = line
+
+            added, failed = self.database.add_proxies_bulk(server_code, [proxy_line])
+            added_total += added
+            failed_total += failed
+
+        self.telegram.send_message(
+            chat_id=self._chat_id(message),
+            text=f"Добавлено прокси: <b>{added_total}</b>, ошибок: <b>{failed_total}</b>.",
+            reply_markup=pool_keyboard(),
+        )
+
+    def process_admin_broadcast_input(self, message: dict[str, Any], text: str) -> None:
+        user = message.get("from")
+        if not user:
+            return
+        uid = int(user["id"])
+        if not is_admin(uid, self.settings.admin_ids):
+            return
+
+        if not text.strip():
+            self.telegram.send_message(chat_id=self._chat_id(message), text="Текст рассылки не может быть пустым.")
+            return
+
+        self.pending_admin_broadcast_drafts[uid] = text
+        total_users = len(self.database.get_all_active_user_ids())
+
+        self.telegram.send_message(
+            chat_id=self._chat_id(message),
+            text=build_broadcast_preview_text(text, total_users),
+            reply_markup=broadcast_confirm_keyboard(),
+        )
+
+    def _run_broadcast(self, admin_id: int, broadcast_text: str) -> None:
+        user_ids = self.database.get_all_active_user_ids()
+        sent = 0
+        failed = 0
+
+        for uid in user_ids:
+            try:
+                self.telegram.send_message(chat_id=uid, text=broadcast_text)
+                sent += 1
+            except Exception as exc:
+                failed += 1
+                logging.warning("Broadcast failed for user %s: %s", uid, exc)
+            time.sleep(0.04)  # ~25 сообщений в секунду (Telegram rate limit safe)
+
+        try:
+            self.telegram.send_message(
+                chat_id=admin_id,
+                text=(
+                    "📢 <b>Рассылка завершена!</b>\n\n"
+                    f"Всего получателей: <code>{len(user_ids)}</code>\n"
+                    f"Успешно доставлено: <code>{sent}</code>\n"
+                    f"Ошибок (бот заблокирован и т.п.): <code>{failed}</code>"
+                ),
+            )
+        except Exception:
+            logging.exception("Failed to send broadcast summary to admin %s", admin_id)
 
     def process_admin_promocode_input(self, message: dict[str, Any], text: str) -> None:
         user = message.get("from")
@@ -1302,7 +1486,6 @@ class BotApp:
             _reject("Код не может быть пустым.")
             return
 
-        # free_proxy: CODE [max_uses]; balance/discount: CODE value [max_uses]
         if reward_type == "free_proxy":
             reward_value = 1.0
             max_uses_text = parts[1] if len(parts) > 1 else "0"
@@ -1316,8 +1499,8 @@ class BotApp:
             except ValueError:
                 _reject("Значение должно быть числом.")
                 return
-            if reward_value <= 0:
-                _reject("Значение должно быть больше нуля.")
+            if not math.isfinite(reward_value) or reward_value <= 0 or reward_value > 100_000:
+                _reject("Значение должно быть числом от 0.01 до 100 000.")
                 return
             if reward_type == "discount" and reward_value >= 100:
                 _reject("Скидка должна быть меньше 100%.")
@@ -1329,8 +1512,8 @@ class BotApp:
         except ValueError:
             _reject("Лимит активаций должен быть целым числом (0 = без лимита).")
             return
-        if max_uses < 0:
-            _reject("Лимит активаций не может быть отрицательным.")
+        if not math.isfinite(max_uses) or max_uses < 0 or max_uses > 1_000_000:
+            _reject("Лимит активаций должен быть от 0 до 1 000 000.")
             return
 
         created = self.database.create_promocode(
@@ -1341,7 +1524,7 @@ class BotApp:
             max_uses=max_uses,
         )
         if not created:
-            self.telegram.send_message(chat_id=self._chat_id(message), text="Такой промокод уже существует.")
+            self.telegram.send_message(chat_id=self._chat_id(message), text="Такой промокод уже существует или содержит недопустимые символы.")
             return
 
         if reward_type == "discount":
@@ -1353,7 +1536,7 @@ class BotApp:
         limit_text = f"{max_uses}" if max_uses > 0 else "без лимита"
         self.telegram.send_message(
             chat_id=self._chat_id(message),
-            text=f"Промокод <code>{code}</code> создан: {reward_text}, активаций: {limit_text}",
+            text=f"Промокод <code>{escape(code)}</code> создан: {reward_text}, активаций: {limit_text}",
         )
 
     def process_admin_price_input(self, message: dict[str, Any], text: str) -> None:
@@ -1384,13 +1567,14 @@ class BotApp:
         except ValueError:
             _reject("Цена должна быть числом. Пример: 79 или 79.5")
             return
-        if new_price <= 0:
+        if not math.isfinite(new_price) or math.isnan(new_price) or new_price <= 0:
             _reject("Цена должна быть больше нуля.")
             return
         if new_price > 1_000_000:
-            _reject("Слишком большая цена. Введите разумное значение.")
+            _reject("Слишком большая цена. Введите значение до 1 000 000 ₽.")
             return
 
+        new_price = round(new_price, 2)
         updated = update_server_item(server_code, {"price_rub": new_price})
         if updated is None:
             self.telegram.send_message(
@@ -1401,7 +1585,7 @@ class BotApp:
         self.telegram.send_message(
             chat_id=self._chat_id(message),
             text=(
-                f"Цена сервера <b>{updated['name']}</b> обновлена: "
+                f"Цена сервера <b>{escape(updated['name'])}</b> обновлена: "
                 f"<code>{float(updated['price_rub']):.2f} ₽</code>"
             ),
         )
@@ -1429,7 +1613,6 @@ class BotApp:
         target_raw = parts[0].strip()
         reason = parts[1].strip() if len(parts) > 1 else None
 
-        # Определяем целевой user_id: либо число, либо @username из базы.
         target_id: int | None = None
         if target_raw.lstrip("-").isdigit():
             target_id = int(target_raw)
@@ -1446,9 +1629,9 @@ class BotApp:
         if action == "remove":
             removed = self.database.unblock_user(target_id)
             status = (
-                f"Пользователь <code>{target_id}</code> разблокирован."
+                f"Пользователь <code>{escape(str(target_id))}</code> разблокирован."
                 if removed
-                else f"Пользователь <code>{target_id}</code> не был заблокирован."
+                else f"Пользователь <code>{escape(str(target_id))}</code> не был заблокирован."
             )
         else:
             if is_admin(target_id, self.settings.admin_ids):
@@ -1458,8 +1641,8 @@ class BotApp:
                 )
                 return
             self.database.block_user(target_id, reason, int(user["id"]))
-            reason_text = f"\nПричина: {reason}" if reason else ""
-            status = f"Пользователь <code>{target_id}</code> заблокирован.{reason_text}"
+            reason_text = f"\nПричина: {escape(reason)}" if reason else ""
+            status = f"Пользователь <code>{escape(str(target_id))}</code> заблокирован.{reason_text}"
 
         self.telegram.send_message(
             chat_id=self._chat_id(message),
@@ -1508,11 +1691,14 @@ class BotApp:
         callback_id = callback.get("id")
         if not callback_id:
             return
-        self.telegram.answer_callback_query(
-            callback_query_id=callback_id,
-            text=text,
-            show_alert=show_alert,
-        )
+        try:
+            self.telegram.answer_callback_query(
+                callback_query_id=callback_id,
+                text=text,
+                show_alert=show_alert,
+            )
+        except TelegramAPIError as exc:
+            logging.debug("answer_callback ignored error: %s", exc)
 
     def _chat_id(self, message: dict[str, Any]) -> int:
         chat = message.get("chat") or {}
@@ -1542,7 +1728,6 @@ class BotApp:
                 reply_markup=reply_markup,
             )
 
-
     def edit_message_content(
         self,
         message: dict[str, Any],
@@ -1554,30 +1739,58 @@ class BotApp:
         message_id = int(message["message_id"])
 
         if photo_path and photo_path.exists():
-            self.telegram.edit_message_media(
-                chat_id=chat_id,
-                message_id=message_id,
-                media_path=photo_path,
-                caption=text,
-                reply_markup=reply_markup,
-            )
-            return
+            try:
+                self.telegram.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media_path=photo_path,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+                return
+            except TelegramAPIError as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+                try:
+                    self.telegram.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+                except Exception:
+                    pass
+                self.telegram.send_photo(
+                    chat_id=chat_id,
+                    photo_path=photo_path,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+                return
 
         if message.get("photo"):
-            self.telegram.edit_message_caption(
+            try:
+                self.telegram.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+                return
+            except TelegramAPIError as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+
+        try:
+            self.telegram.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                caption=text,
+                text=text,
                 reply_markup=reply_markup,
             )
-            return
-
-        self.telegram.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
+        except TelegramAPIError as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            self.telegram.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
 
     def start_caption(self) -> str:
         return (
@@ -1598,11 +1811,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server() -> None:
-    """Открывает порт $PORT, чтобы Render (Web Service) не глушил контейнер.
-
-    Бот работает на long-polling и сам порт не слушает, а Render считает
-    деплой неудачным без открытого порта. Отдаём заглушку в фоновом потоке.
-    """
     port_raw = os.getenv("PORT")
     if not port_raw:
         return
@@ -1615,8 +1823,6 @@ def start_health_server() -> None:
     try:
         server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
     except OSError as exc:
-        # Порт уже занят — например, бот запущен под супервизором run_all.py,
-        # который сам держит health-порт. Это нормально, просто пропускаем.
         logging.info("Health-порт %s занят (%s) — свой сервер не поднимаю", port, exc)
         return
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1625,11 +1831,6 @@ def start_health_server() -> None:
 
 
 def start_keep_alive(interval_seconds: int = 600) -> None:
-    """Пингует собственный URL, чтобы free Web Service на Render не засыпал.
-
-    Бесплатный сервис усыпляется после ~15 мин без входящих HTTP-запросов.
-    Раз в 10 минут дёргаем свой health-эндпоинт, чтобы оставаться живым.
-    """
     base_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
     if not base_url:
         logging.info("RENDER_EXTERNAL_URL не задан — keep-alive отключён")
@@ -1644,7 +1845,7 @@ def start_keep_alive(interval_seconds: int = 600) -> None:
                 with urlopen(url, timeout=30) as response:
                     response.read()
                 logging.info("Keep-alive ping ok: %s", url)
-            except Exception as exc:  # noqa: BLE001 - пинг не должен ронять бота
+            except Exception as exc:
                 logging.warning("Keep-alive ping failed: %s", exc)
 
     thread = threading.Thread(target=_loop, daemon=True)
