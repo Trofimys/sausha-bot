@@ -1756,20 +1756,6 @@ class BotApp:
         chat_id = self._chat_id(message)
         message_id = int(message["message_id"])
 
-        # Если сообщение уже с фото — мгновенно обновляем подпись и кнопки (20-30 мс, без мерцания и повторной заливки)
-        if message.get("photo"):
-            try:
-                self.telegram.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption=text,
-                    reply_markup=reply_markup,
-                )
-                return
-            except TelegramAPIError as exc:
-                if "message is not modified" in str(exc).lower():
-                    return
-
         if photo_path and photo_path.exists():
             try:
                 self.telegram.edit_message_media(
@@ -1783,6 +1769,7 @@ class BotApp:
             except TelegramAPIError as exc:
                 if "message is not modified" in str(exc).lower():
                     return
+                # Пытаемся удалить старое сообщение (например, если это был просто текст)
                 try:
                     self.telegram.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
                 except Exception:
@@ -1795,6 +1782,7 @@ class BotApp:
                 )
                 return
 
+        # Если фото нет, но сообщение нужно обновить
         try:
             self.telegram.edit_message_text(
                 chat_id=chat_id,
@@ -1805,6 +1793,11 @@ class BotApp:
         except TelegramAPIError as exc:
             if "message is not modified" in str(exc).lower():
                 return
+            # Если не удалось обновить текст (например, текущее сообщение - это фото), удаляем и шлем текстом
+            try:
+                self.telegram.call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+            except Exception:
+                pass
             self.telegram.send_message(
                 chat_id=chat_id,
                 text=text,

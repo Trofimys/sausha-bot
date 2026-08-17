@@ -27,7 +27,7 @@ def load_settings() -> Settings:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+            os.environ[key.strip()] = value.strip()
 
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     if not bot_token:
