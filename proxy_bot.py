@@ -108,7 +108,7 @@ class BotApp:
             self.settings.yookassa_shop_id,
             self.settings.yookassa_secret_key,
         )
-        self.telegram = TelegramAPI(self.settings.bot_token)
+        self.telegram = TelegramAPI(self.settings.bot_token, db=self.database)
         self.bot_info = self.telegram.get_me()
         self.offset: int | None = None
         self.pending_top_up_amount_users: dict[int, int] = {}
@@ -139,22 +139,26 @@ class BotApp:
         self.telegram.delete_webhook(drop_pending_updates=True)
         logging.info("Bot started as @%s", self.bot_info.get("username"))
 
+        from concurrent.futures import ThreadPoolExecutor
+        executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bot-worker")
+
         while True:
             try:
                 updates = self.telegram.get_updates(offset=self.offset, timeout=25)
                 for update in updates:
-                    try:
-                        self.process_update(update)
-                    except Exception:
-                        logging.exception(
-                            "Failed to process update %s", update.get("update_id")
-                        )
                     update_id = update.get("update_id")
                     if update_id is not None:
-                        self.offset = int(update_id) + 1
+                        self.offset = max(self.offset or 0, int(update_id) + 1)
+                    executor.submit(self._safe_process_update, update)
             except Exception as exc:
                 logging.exception("Polling loop failed: %s", exc)
-                time.sleep(3)
+                time.sleep(1)
+
+    def _safe_process_update(self, update: dict[str, Any]) -> None:
+        try:
+            self.process_update(update)
+        except Exception:
+            logging.exception("Failed to process update %s", update.get("update_id"))
 
     def process_update(self, update: dict[str, Any]) -> None:
         if not isinstance(update, dict):
@@ -301,6 +305,11 @@ class BotApp:
             self.process_payment_callback(callback, data)
             return
 
+        if data.startswith("user:pay:"):
+            self.answer_callback(callback)
+            self.send_top_up_prompt(callback)
+            return
+
         if data.startswith("user:server:"):
             self.answer_callback(callback, "Сервер выбран")
             self.send_selected_server(callback, data)
@@ -312,7 +321,6 @@ class BotApp:
             return
 
         if data.startswith("invoice:check:"):
-            self.answer_callback(callback)
             self.check_invoice(callback, data.removeprefix("invoice:check:"))
             return
 
@@ -669,18 +677,17 @@ class BotApp:
             self.purchase_with_balance(callback, purpose, value)
             return
 
-        # Мгновенный ответ Telegram, чтобы кнопка не крутилась и интерфейс не подвисал
-        self.answer_callback(callback)
-
         if method in {"sbp", "card"}:
+            self.answer_callback(callback, "Создаём платёж...")
             self.create_yookassa_payment(callback, purpose, value, method)
             return
 
-        if method != "cryptobot":
-            self.answer_callback(callback, "Неизвестный способ оплаты.", show_alert=True)
+        if method == "cryptobot":
+            self.answer_callback(callback, "Создаём счёт...")
+            self.create_cryptobot_invoice(callback, purpose, value)
             return
 
-        self.create_cryptobot_invoice(callback, purpose, value)
+        self.answer_callback(callback, "Неизвестный способ оплаты.", show_alert=True)
 
     def _buy_and_store_proxy(self, user_id: int, server_code: str) -> tuple[bool, str, dict[str, Any] | None]:
         """Покупает/выдаёт прокси по настройкам сервера и сохраняет пользователю.
@@ -848,17 +855,17 @@ class BotApp:
             return
 
         if not self.cryptobot.is_configured():
-            self.answer_callback(callback, "CryptoBot не настроен.", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text="CryptoBot не настроен.")
             return
 
         if purpose == "topup":
             try:
                 amount = float(value)
             except ValueError:
-                self.answer_callback(callback, "Некорректная сумма.", show_alert=True)
+                self.telegram.send_message(chat_id=self._chat_id(message), text="Некорректная сумма.")
                 return
             if not math.isfinite(amount) or amount < 10.0 or amount > 500_000.0:
-                self.answer_callback(callback, "Некорректная сумма пополнения.", show_alert=True)
+                self.telegram.send_message(chat_id=self._chat_id(message), text="Некорректная сумма пополнения.")
                 return
             title = "Пополнение баланса"
             server_code = None
@@ -870,7 +877,7 @@ class BotApp:
         elif purpose == "buy":
             server_item = get_server_map().get(value)
             if server_item is None:
-                self.answer_callback(callback, "Сервер не найден.", show_alert=True)
+                self.telegram.send_message(chat_id=self._chat_id(message), text="Сервер не найден.")
                 return
             user_record = self.database.get_user(int(user["id"])) or {}
             base_amount = float(server_item["price_rub"])
@@ -884,7 +891,7 @@ class BotApp:
             proxy_period = None
             description = f"Покупка {server_item['name']} Proxy"
         else:
-            self.answer_callback(callback, "Неизвестный тип оплаты.", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text="Неизвестный тип оплаты.")
             return
 
         try:
@@ -894,13 +901,13 @@ class BotApp:
                 payload=f"{purpose}:{user['id']}:{value}",
             )
         except CryptoBotError as exc:
-            self.answer_callback(callback, f"Ошибка CryptoBot: {exc}", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text=f"Ошибка CryptoBot: {escape(str(exc))}")
             return
 
         invoice_id = str(invoice.get("invoice_id", ""))
         pay_url = str(invoice.get("bot_invoice_url") or invoice.get("pay_url") or "")
         if not invoice_id or not pay_url:
-            self.answer_callback(callback, "CryptoBot не вернул ссылку на оплату.", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text="CryptoBot не вернул ссылку на оплату.")
             return
 
         self.database.save_invoice(
@@ -926,21 +933,27 @@ class BotApp:
     def _resolve_payment_target(
         self, callback: dict[str, Any], purpose: str, value: str, user: dict[str, Any]
     ) -> tuple[float, str, str, str | None] | None:
+        message = callback.get("message")
+        chat_id = self._chat_id(message) if message else None
+
         if purpose == "topup":
             try:
                 amount = float(value)
             except ValueError:
-                self.answer_callback(callback, "Некорректная сумма.", show_alert=True)
+                if chat_id:
+                    self.telegram.send_message(chat_id=chat_id, text="Некорректная сумма.")
                 return None
             if not math.isfinite(amount) or amount < 10.0 or amount > 500_000.0:
-                self.answer_callback(callback, "Некорректная сумма пополнения.", show_alert=True)
+                if chat_id:
+                    self.telegram.send_message(chat_id=chat_id, text="Некорректная сумма пополнения.")
                 return None
             return amount, "Пополнение баланса", f"Пополнение баланса на {amount:.2f} RUB", None
 
         if purpose == "buy":
             server_item = get_server_map().get(value)
             if server_item is None:
-                self.answer_callback(callback, "Сервер не найден.", show_alert=True)
+                if chat_id:
+                    self.telegram.send_message(chat_id=chat_id, text="Сервер не найден.")
                 return None
             user_record = self.database.get_user(int(user["id"])) or {}
             base_amount = float(server_item["price_rub"])
@@ -949,7 +962,8 @@ class BotApp:
             title = f"{server_item['name']} Proxy"
             return amount, title, f"Покупка {server_item['name']} Proxy", value
 
-        self.answer_callback(callback, "Неизвестный тип оплаты.", show_alert=True)
+        if chat_id:
+            self.telegram.send_message(chat_id=chat_id, text="Неизвестный тип оплаты.")
         return None
 
     def create_yookassa_payment(
@@ -961,7 +975,7 @@ class BotApp:
             return
 
         if not self.yookassa.is_configured():
-            self.answer_callback(callback, "Оплата картой/СБП не настроена.", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text="Оплата картой/СБП не настроена.")
             return
 
         resolved = self._resolve_payment_target(callback, purpose, value, user)
@@ -982,14 +996,14 @@ class BotApp:
             )
         except YooKassaError as exc:
             logging.exception("YooKassa create_payment failed")
-            self.answer_callback(callback, f"Ошибка оплаты: {exc}", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text=f"Ошибка оплаты: {escape(str(exc))}")
             return
 
         payment_id = str(payment.get("id", ""))
         confirmation = payment.get("confirmation") or {}
         pay_url = str(confirmation.get("confirmation_url") or confirmation.get("confirmation_data") or "")
         if not payment_id or not pay_url:
-            self.answer_callback(callback, "YooKassa не вернула ссылку на оплату.", show_alert=True)
+            self.telegram.send_message(chat_id=self._chat_id(message), text="YooKassa не вернула ссылку на оплату.")
             return
 
         self.database.save_invoice(
@@ -1742,6 +1756,20 @@ class BotApp:
         chat_id = self._chat_id(message)
         message_id = int(message["message_id"])
 
+        # Если сообщение уже с фото — мгновенно обновляем подпись и кнопки (20-30 мс, без мерцания и повторной заливки)
+        if message.get("photo"):
+            try:
+                self.telegram.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+                return
+            except TelegramAPIError as exc:
+                if "message is not modified" in str(exc).lower():
+                    return
+
         if photo_path and photo_path.exists():
             try:
                 self.telegram.edit_message_media(
@@ -1766,19 +1794,6 @@ class BotApp:
                     reply_markup=reply_markup,
                 )
                 return
-
-        if message.get("photo"):
-            try:
-                self.telegram.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption=text,
-                    reply_markup=reply_markup,
-                )
-                return
-            except TelegramAPIError as exc:
-                if "message is not modified" in str(exc).lower():
-                    return
 
         try:
             self.telegram.edit_message_text(

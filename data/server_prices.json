@@ -5,7 +5,7 @@
     "price_rub": 39.0,
     "markup_percent": 20.0,
     "allowed_versions": [
-      "ipv4"
+      "4"
     ],
     "allowed_countries": [
       "ru"
@@ -19,26 +19,44 @@
     "name": "Funtime",
     "price_rub": 59.0,
     "markup_percent": 20.0,
-    "allowed_versions": [],
-    "allowed_countries": [],
-    "allowed_periods": []
+    "allowed_versions": [
+      "4"
+    ],
+    "allowed_countries": [
+      "ru"
+    ],
+    "allowed_periods": [
+      7
+    ]
   },
   {
     "code": "reallyworld",
     "name": "Reallyworld",
     "price_rub": 59.0,
     "markup_percent": 20.0,
-    "allowed_versions": [],
-    "allowed_countries": [],
-    "allowed_periods": []
+    "allowed_versions": [
+      "4"
+    ],
+    "allowed_countries": [
+      "ru"
+    ],
+    "allowed_periods": [
+      7
+    ]
   },
   {
     "code": "spookytime",
     "name": "Spookytime",
     "price_rub": 59.0,
     "markup_percent": 20.0,
-    "allowed_versions": [],
-    "allowed_countries": [],
-    "allowed_periods": []
+    "allowed_versions": [
+      "4"
+    ],
+    "allowed_countries": [
+      "ru"
+    ],
+    "allowed_periods": [
+      7
+    ]
   }
 ]

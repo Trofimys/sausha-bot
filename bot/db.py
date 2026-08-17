@@ -139,6 +139,15 @@ class Database:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    cache_value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             self._ensure_column(connection, "users", "balance_rub", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(connection, "users", "active_discount_percent", "REAL NOT NULL DEFAULT 0")
             self._ensure_column(connection, "users", "active_discount_code", "TEXT")
@@ -1013,3 +1022,28 @@ class Database:
             "assigned": int(assigned),
             "by_server": by_server,
         }
+
+    def get_cached_value(self, key: str) -> str | None:
+        """Получает закэшированное строковое значение (например file_id фото)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT cache_value FROM system_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["cache_value"]) if row else None
+
+    def set_cached_value(self, key: str, value: str) -> None:
+        """Сохраняет значение в постоянный системный кэш SQLite."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO system_cache (cache_key, cache_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    cache_value = excluded.cache_value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
+            connection.commit()

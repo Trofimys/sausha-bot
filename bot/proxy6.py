@@ -18,6 +18,19 @@ class Proxy6Client:
         "5": "MTproto",
         "6": "IPv6",
     }
+    VERSION_MAP = {
+        "ipv4": "4",
+        "ipv4_individual": "4",
+        "individual": "4",
+        "4": "4",
+        "ipv4_shared": "3",
+        "shared": "3",
+        "3": "3",
+        "ipv6": "6",
+        "6": "6",
+        "mtproto": "5",
+        "5": "5",
+    }
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
@@ -46,11 +59,15 @@ class Proxy6Client:
         if not self.api_key:
             return {"configured": False, "status": "no", "error": "Proxy6 API key is not set"}
 
+        version_raw = str(version).lower().strip()
+        version_code = self.VERSION_MAP.get(version_raw, version_raw)
+        country_code = str(country).lower().strip()
+
         params = {
             "count": str(max(1, int(count))),
             "period": str(max(1, int(period))),
-            "country": country,
-            "version": str(version),
+            "country": country_code,
+            "version": version_code,
             "type": proxy_type,
         }
         payload = self._call("buy", params)
