@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: sausha-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: BOT1_TOKEN
+        sync: false
+      - key: BOT2_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: BOT1_CHANNEL_ID
+        value: "-1003854171715"
+      - key: BOT1_DISCUSSION_CHAT_ID
+        value: "-1003718571364"
+      - key: BOT2_CHANNEL_ID
+        value: "-1003854171715"
+      - key: BOT2_USERNAME
+        value: "Shkola6_anonchik_bot"
+      - key: BOT2_CHAT_INVITE
+        value: "https://t.me/+N1hmM9BYc1VkZWQ1"
+      - key: MODERATION_LOG_CHANNEL_ID
+        value: "-1003911650264"
+      - key: MODERATION_LOG_CHANNEL_LINK
+        value: "https://t.me/drsgdfg"
+      - key: SE_USER
+        value: "422568370"
+      - key: SE_SECRET
+        value: "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"
+      - key: SE_MONTH_LIMIT
+        value: "2000"
+      - key: RENDER_URL
+        sync: false
