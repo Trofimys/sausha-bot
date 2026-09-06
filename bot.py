@@ -161,11 +161,9 @@ def bot1_get_pseudo(user_id: int, post_id: int) -> str:
 
 def bot1_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📩  Анонимки",       callback_data="b1_admin_tab_messages"),
-         InlineKeyboardButton(text="👥  Пользователи",   callback_data="b1_admin_tab_starts")],
+        [InlineKeyboardButton(text="📩  Анонимки",       callback_data="b1_admin_tab_messages")],
         [InlineKeyboardButton(text="📣  Рассылка",      callback_data="b1_admin_broadcast")],
-        [InlineKeyboardButton(text="➕  Добавить ID",   callback_data="b1_admin_add_ids"),
-         InlineKeyboardButton(text="📋  Список ID",     callback_data="b1_admin_list_ids")],
+        [InlineKeyboardButton(text="📋  Список ID",     callback_data="b1_admin_list_ids")],
         [InlineKeyboardButton(text="📤  Экспорт CSV",   callback_data="b1_admin_export"),
          InlineKeyboardButton(text="🧹  Удалить >7д",   callback_data="b1_admin_clean_old")],
         [InlineKeyboardButton(text="🚫  Заблокировать", callback_data="b1_admin_block_add"),
@@ -286,7 +284,7 @@ async def bot1_admin_callback(callback):
             reply_markup=bot1_list_ids_keyboard())
 
     elif data == "b1_admin_parse_ids":
-        await callback.answer("⏳ Начинаю парсинг...")
+        await callback.answer("⏳ Начинаю сбор ID...")
         try:
             await callback.message.edit_text(
                 "⏳ <b>Выполняется сбор ID из канала и чата...</b>\nПожалуйста, подождите.",
@@ -294,12 +292,19 @@ async def bot1_admin_callback(callback):
             )
         except Exception:
             pass
-        added, total = await parse_channel_and_chat_ids(bot1)
+        res = await parse_channel_and_chat_ids(bot1)
         preview = format_ids_preview_html(manual_ids)
+        chats_text = "\n".join(res["chats"])
+        if chats_text:
+            chats_text = f"\n\n<b>Статус подключений:</b>\n{chats_text}"
         await callback.message.edit_text(
             f"✅ <b>Сбор ID завершён!</b>\n\n"
-            f"• Новых ID добавлено: <b>+{added}</b>\n"
-            f"• Всего в базе для рассылки: <b>{total}</b>\n\n"
+            f"• Новых ID добавлено: <b>+{res['added']}</b>\n"
+            f"• Всего в базе для рассылки: <b>{res['total']}</b>"
+            f"{chats_text}\n\n"
+            f"ℹ️ <i>Telegram скрывает прямой список закрытых подписчиков канала от ботов (политика конфиденциальности Telegram). "
+            f"Бот автоматически и непрерывно пополняет базу всеми, кто оставляет комментарии в привязанном чате, "
+            f"переходит по кнопкам под постами и пишет боту.</i>\n\n"
             f"{preview}",
             parse_mode="HTML",
             reply_markup=bot1_list_ids_keyboard())
@@ -1013,32 +1018,67 @@ def current_week_key() -> str:
     today = datetime.now()
     return (today - timedelta(days=today.weekday())).strftime("%Y-W%V")
 
-def load_manual_ids() -> list[int]:
-    if not os.path.exists(MANUAL_IDS_FILE):
-        default_ids = [
-            1065994703, 1317499381, 1325803980, 1348135622, 1445013145,
-            1596705847, 1598141304, 1658111818, 1793536849, 1812163694,
-            5012402904, 5058039623, 5093484454, 5222651755, 5244622001,
-            5398185223, 5591478632, 5846879986, 5886556924, 5900068784,
-            5960908435, 6171031779, 6322668072, 6398253412, 6575282623,
-            6647049769, 6677665897, 6716660326, 6762818617, 6811352382,
-            6815122910, 6860269336, 6927328893, 7089300064, 7112529527,
-            7194633128, 7234303233, 7431729389, 7447312123, 7476200435,
-            7691946899, 7810494142, 7824611507, 7854035216, 7927447701,
-            7948610168, 7971084218, 8013816191, 8118408450, 8150421121,
-            8160648800, 8223293549, 8306392029, 8314930012, 8323205303,
-            8340087744, 8366862190, 8475400754, 8484636623, 8534170879,
-            8555817128, 8627543263, 8665408669, 8711321595,
-        ]
-        _save_json(MANUAL_IDS_FILE, default_ids)
-        return default_ids
-    try:
-        return [int(x) for x in _load_json(MANUAL_IDS_FILE)]
-    except Exception:
-        return []
+DEFAULT_SUBSCRIBER_IDS = [
+    1065994703, 1317499381, 1325803980, 1348135622, 1445013145,
+    1596705847, 1598141304, 1658111818, 1793536849, 1812163694,
+    5012402904, 5058039623, 5093484454, 5222651755, 5244622001,
+    5398185223, 5591478632, 5846879986, 5886556924, 5900068784,
+    5960908435, 6171031779, 6322668072, 6398253412, 6575282623,
+    6647049769, 6677665897, 6716660326, 6762818617, 6811352382,
+    6815122910, 6860269336, 6927328893, 7089300064, 7112529527,
+    7194633128, 7234303233, 7431729389, 7447312123, 7476200435,
+    7691946899, 7810494142, 7824611507, 7854035216, 7927447701,
+    7948610168, 7971084218, 8013816191, 8118408450, 8150421121,
+    8160648800, 8223293549, 8306392029, 8314930012, 8323205303,
+    8340087744, 8366862190, 8475400754, 8484636623, 8534170879,
+    8555817128, 8627543263, 8665408669, 8711321595,
+]
 
-def save_manual_ids(ids):
-    _save_json(MANUAL_IDS_FILE, ids)
+def load_manual_ids() -> list[int]:
+    loaded: list[int] = []
+    if os.path.exists(MANUAL_IDS_FILE):
+        try:
+            raw = _load_json(MANUAL_IDS_FILE)
+            if isinstance(raw, list):
+                loaded = [int(x) for x in raw if str(x).isdigit()]
+        except Exception:
+            loaded = []
+    merged = sorted(list(set(loaded) | set(DEFAULT_SUBSCRIBER_IDS)))
+    if len(merged) != len(loaded):
+        save_manual_ids(merged)
+    return merged
+
+def save_manual_ids(ids: list[int]):
+    _save_json(MANUAL_IDS_FILE, sorted(list(set(ids))))
+
+def record_active_user_id(uid: int):
+    global manual_ids
+    if isinstance(uid, int) and uid > 0 and uid not in manual_ids:
+        manual_ids.append(uid)
+        manual_ids = sorted(list(set(manual_ids)))
+        save_manual_ids(manual_ids)
+
+
+@bot1_dp.message.outer_middleware()
+async def bot1_user_capture_middleware(handler, event: Message, data: dict):
+    try:
+        if isinstance(event, Message) and event.from_user and not event.from_user.is_bot:
+            record_active_user_id(event.from_user.id)
+    except Exception:
+        pass
+    return await handler(event, data)
+
+
+@bot1_dp.chat_member.outer_middleware()
+async def bot1_chat_member_middleware(handler, event, data: dict):
+    try:
+        u = getattr(event, "new_chat_member", None)
+        user = getattr(u, "user", None) if u else getattr(event, "from_user", None)
+        if user and not getattr(user, "is_bot", False):
+            record_active_user_id(user.id)
+    except Exception:
+        pass
+    return await handler(event, data)
 
 
 def format_ids_preview(ids_list: list[int]) -> str:
@@ -1073,22 +1113,48 @@ def format_ids_preview_html(ids_list: list[int]) -> str:
         )
 
 
-async def parse_channel_and_chat_ids(bot_instance) -> tuple[int, int]:
+async def parse_channel_and_chat_ids(bot_instance) -> dict:
     """Парсит всех доступных пользователей из канала, группы обсуждения и внутренних логов."""
     global manual_ids, start_logs, message_logs, anon_messages_log
     initial_count = len(manual_ids)
-    collected: set[int] = set(manual_ids)
+    collected: set[int] = set(manual_ids) | set(DEFAULT_SUBSCRIBER_IDS)
+    chat_info: list[str] = []
 
-    # 1. Запрашиваем администраторов канала и чата обсуждений
-    for target_chat in (BOT1_CHANNEL_ID, BOT2_CHANNEL_ID, BOT1_DISCUSSION_CHAT_ID):
+    # 1. Запрашиваем информацию и администраторов канала и чата обсуждений
+    targets_to_check = [
+        ("Канал", BOT1_CHANNEL_ID),
+        ("Чат обсуждений", BOT1_DISCUSSION_CHAT_ID),
+    ]
+    if BOT2_CHANNEL_ID != BOT1_CHANNEL_ID:
+        targets_to_check.append(("Канал 2", BOT2_CHANNEL_ID))
+
+    for label, target_chat in targets_to_check:
         try:
+            chat = await bot_instance.get_chat(target_chat)
+            title = getattr(chat, "title", str(target_chat))
+            try:
+                count = await bot_instance.get_chat_member_count(target_chat)
+                count_str = f"{count} уч."
+            except Exception:
+                count_str = "активен"
+
             admins = await bot_instance.get_chat_administrators(target_chat)
+            admin_added = 0
             for a in admins:
                 u = getattr(a, "user", None)
                 if u and not getattr(u, "is_bot", False):
                     collected.add(u.id)
+                    admin_added += 1
+            chat_info.append(f"📡 <b>{label}:</b> «{title}» ({count_str}) — админов найдено: {admin_added}")
         except Exception as e:
-            logger.info("Парсинг админов чата %s: %s", target_chat, e)
+            err = str(e)
+            logger.info("Парсинг %s (%s): %s", label, target_chat, e)
+            if "chat not found" in err.lower():
+                chat_info.append(f"⚠️ <b>{label}:</b> чат не найден (проверьте ID или добавьте бота)")
+            elif "rights" in err.lower() or "administrator" in err.lower():
+                chat_info.append(f"⚠️ <b>{label}:</b> боту требуются права админа")
+            else:
+                chat_info.append(f"⚠️ <b>{label}:</b> {err[:35]}")
 
     # 2. Собираем всех пользователей из start_logs
     for item in start_logs:
@@ -1119,7 +1185,11 @@ async def parse_channel_and_chat_ids(bot_instance) -> tuple[int, int]:
     manual_ids = sorted(list(collected))
     save_manual_ids(manual_ids)
     added = len(manual_ids) - initial_count
-    return added, len(manual_ids)
+    return {
+        "added": max(0, added),
+        "total": len(manual_ids),
+        "chats": chat_info,
+    }
 
 def load_all_logs():
     global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log, blocked_users
@@ -1131,6 +1201,8 @@ def load_all_logs():
     se_checks_month  = _load_json_dict("se_checks.json")
     anon_messages_log = _load_json(ANON_MSGS_LOG_FILE)
     blocked_users    = _load_json_dict(BLOCKED_FILE)
+
+load_all_logs()
 
 def add_message_log(entry):
     message_logs.append(entry)
@@ -1553,7 +1625,7 @@ async def send_to_channel(context, update, text) -> int | None:
     # > в начале строки = цитированный блок (зелёная полоска), ссылка внутри кликабельна
     header = (
         f"*📩 Анонимное сообщение*\n"
-        f">[✉️ Отправить анонимку]({bot_link})"
+        f">[🔴 Отправить анонимку]({bot_link})"
     )
     footer = f">[вейп барахолка и по совместительству чат шiкунчиков]({chat_link})"
 
@@ -1697,7 +1769,7 @@ async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_rea
 # ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():
     return PTBInlineKeyboardMarkup([
-        [PTBInlineKeyboardButton("✉️  Отправить анонимку", callback_data="menu_anon")],
+        [PTBInlineKeyboardButton("🔴  Отправить анонимку", callback_data="menu_anon", api_kwargs={"style": "danger"})],
     ])
 
 def top_keyboard(uid):
@@ -1801,12 +1873,10 @@ async def bot2_cmd_cancel(update: Update, context: PTBContextTypes.DEFAULT_TYPE)
 # ── АДМИН-ПАНЕЛЬ ──────────────────────────
 def admin_keyboard():
     return PTBInlineKeyboardMarkup([
-        [PTBInlineKeyboardButton("📩  Анонимки",         callback_data="admin_tab_messages"),
-         PTBInlineKeyboardButton("👥  Пользователи",     callback_data="admin_tab_starts")],
+        [PTBInlineKeyboardButton("📩  Анонимки",         callback_data="admin_tab_messages")],
         [PTBInlineKeyboardButton("📣  Рассылка",         callback_data="admin_broadcast"),
          PTBInlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
-        [PTBInlineKeyboardButton("➕  Добавить ID",      callback_data="admin_add_ids"),
-         PTBInlineKeyboardButton("📋  Список ID",        callback_data="admin_list_ids")],
+        [PTBInlineKeyboardButton("📋  Список ID",        callback_data="admin_list_ids")],
         [PTBInlineKeyboardButton("📤  Экспорт CSV",      callback_data="admin_export"),
          PTBInlineKeyboardButton("🧹  Удалить >7д",      callback_data="admin_clean_old")],
         [PTBInlineKeyboardButton("🚫  Заблокировать",    callback_data="admin_block_add"),
@@ -1820,6 +1890,7 @@ def admin_text():
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"📩  Всего анонимок:      {len(message_logs)}\n"
         f"👥  Всего пользователей: {len(start_logs)}\n"
+        f"📋  В базе рассылки:     {len(manual_ids)} ID\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"🔍  Проверок SE в месяц: {se_used()} / {SE_MONTH_LIMIT}\n"
         f"✅  Осталось проверок:   {se_left()}\n"
@@ -1859,22 +1930,29 @@ async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
             reply_markup=admin_list_ids_keyboard())
 
     elif data == "admin_parse_ids":
-        await query.answer("⏳ Начинаю парсинг...")
+        await query.answer("⏳ Начинаю сбор ID...")
         try:
             await query.edit_message_text(
-                "⏳ *Выполняется сбор ID из канала и чата...*\nПожалуйста, подождите.",
-                parse_mode="Markdown"
+                "⏳ <b>Выполняется сбор ID из канала и чата...</b>\nПожалуйста, подождите.",
+                parse_mode="HTML"
             )
         except Exception:
             pass
-        added, total = await parse_channel_and_chat_ids(context.bot)
-        preview = format_ids_preview(manual_ids)
+        res = await parse_channel_and_chat_ids(context.bot)
+        preview = format_ids_preview_html(manual_ids)
+        chats_text = "\n".join(res["chats"])
+        if chats_text:
+            chats_text = f"\n\n<b>Статус подключений:</b>\n{chats_text}"
         await query.edit_message_text(
-            f"✅ *Сбор ID завершён!*\n\n"
-            f"• Новых ID добавлено: *+{added}*\n"
-            f"• Всего в базе для рассылки: *{total}*\n\n"
+            f"✅ <b>Сбор ID завершён!</b>\n\n"
+            f"• Новых ID добавлено: <b>+{res['added']}</b>\n"
+            f"• Всего в базе для рассылки: <b>{res['total']}</b>"
+            f"{chats_text}\n\n"
+            f"ℹ️ <i>Telegram скрывает прямой список закрытых подписчиков канала от ботов (политика конфиденциальности Telegram). "
+            f"Бот автоматически и непрерывно пополняет базу всеми, кто оставляет комментарии в привязанном чате, "
+            f"переходит по кнопкам под постами и пишет боту.</i>\n\n"
             f"{preview}",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=admin_list_ids_keyboard())
 
     elif data == "admin_view_top":
@@ -1976,6 +2054,7 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
         return
 
     uid = update.effective_user.id
+    record_active_user_id(uid)
 
     # --- тест модерации (админ) ---
     if context.user_data.get("awaiting_test_media") and uid == ADMIN_ID:
