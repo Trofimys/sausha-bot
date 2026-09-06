@@ -608,7 +608,7 @@ async def bot1_cmd_start(message: Message, state: FSMContext):
                 await message.answer("❌ Неверная ссылка.")
                 return
         else:
-            await message.answer("уебок 👋 Привет! Нажми кнопочку «• • •» своими сардельками под постом в канале, чтобы оставить анонимный комментарий.")
+            await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
             return
 
         # ── Проверка подписки на чат ──
@@ -1591,9 +1591,6 @@ async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_rea
 def main_keyboard():
     return PTBInlineKeyboardMarkup([
         [PTBInlineKeyboardButton("✉️  Отправить анонимку", callback_data="menu_anon")],
-        [PTBInlineKeyboardButton("🏆  Топ анонимщиков",   callback_data="menu_top")],
-        [PTBInlineKeyboardButton("🤖  Поболтать с ИИ",    callback_data="menu_ai")],
-        [PTBInlineKeyboardButton("❓  Помощь",             callback_data="menu_help")],
     ])
 
 def top_keyboard(uid):
@@ -1619,46 +1616,63 @@ def ai_keyboard():
 
 def after_anon_keyboard():
     return PTBInlineKeyboardMarkup([
-        [PTBInlineKeyboardButton("🔄  Отправить ещё", callback_data="anon_again"),
-         PTBInlineKeyboardButton("🏆  Мой топ",       callback_data="menu_top")],
+        [PTBInlineKeyboardButton("🔄  Отправить ещё", callback_data="anon_again")],
         [PTBInlineKeyboardButton("🏠  Главное меню",  callback_data="menu_back")],
     ])
 
 def back_keyboard(cb="menu_back"):
     return PTBInlineKeyboardMarkup([[PTBInlineKeyboardButton("🔙  Назад", callback_data=cb)]])
 
-# ── ГЛАВНОЕ МЕНЮ ──────────────────────────
-MENU_TEXT = (
-    "👋 Привет!\n\n"
-    "Это бот анонимных сообщений школы 🏫\n"
-    "Здесь ты можешь написать что угодно — никто не узнает что это ты 🤫\n\n"
-    "Выбери действие 👇"
-)
+# ── ГЛАВНОЕ МЕНЮ И СТАРТ ──────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+START_PHOTO_PATH = os.path.join(BASE_DIR, "welcome_chik_school.jpg")
+START_CAPTION = "Нажми на кнопку ниже, чтобы отправить анонимку 👇"
 
 async def main_menu(update: Update, context: PTBContextTypes.DEFAULT_TYPE, edit=False):
     kb = main_keyboard()
     if edit and update.callback_query:
+        msg = update.callback_query.message
         try:
-            await update.callback_query.edit_message_text(MENU_TEXT, reply_markup=kb)
+            if msg and msg.photo:
+                await update.callback_query.edit_message_caption(caption=START_CAPTION, reply_markup=kb)
+                return
+            elif msg and msg.text:
+                await update.callback_query.edit_message_text(START_CAPTION, reply_markup=kb)
+                return
         except Exception:
-            await context.bot.send_message(update.effective_chat.id, MENU_TEXT, reply_markup=kb)
-    else:
-        await update.message.reply_text(MENU_TEXT, reply_markup=kb)
+            pass
+
+    chat_id = update.effective_chat.id
+    if os.path.exists(START_PHOTO_PATH):
+        try:
+            with open(START_PHOTO_PATH, "rb") as photo:
+                await context.bot.send_photo(chat_id=chat_id, photo=photo, caption=START_CAPTION, reply_markup=kb)
+                return
+        except Exception as e:
+            logger.error("Ошибка отправки start photo в main_menu: %s", e)
+    await context.bot.send_message(chat_id, START_CAPTION, reply_markup=kb)
 
 # ── КОМАНДЫ БОТА 2 ────────────────────────
 async def bot2_cmd_start(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     add_start_log(u.id, u.username, u.first_name, u.last_name)
     context.user_data.clear()
+    kb = main_keyboard()
+    if os.path.exists(START_PHOTO_PATH):
+        try:
+            with open(START_PHOTO_PATH, "rb") as photo:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=START_CAPTION,
+                    reply_markup=kb,
+                )
+                return
+        except Exception as e:
+            logger.error("Ошибка отправки start photo: %s", e)
+
     await update.message.reply_text(
-        "🌟 *Добро пожаловать!*\n\n"
-        "Этот бот позволяет тебе:\n\n"
-        "✉️  Отправлять анонимки в канал\n"
-        "🏆  Участвовать в топе анонимщиков\n"
-        "🤖  Общаться с ИИ\n\n"
-        "Всё анонимно — никто не узнает 🔒",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard(),
+        START_CAPTION,
+        reply_markup=kb,
     )
 
 async def bot2_cmd_cancel(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
@@ -2109,13 +2123,20 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
 
     if data == "menu_anon":
         context.user_data["state"] = ANONYMOUS_MODE
-        await query.edit_message_text(
+        anon_prompt = (
             "✉️ *Режим анонимки*\n\n"
             "Отправь текст, фото, видео, голосовое, GIF или стикер.\n"
             "Всё появится в канале без твоего имени 🔒\n\n"
             "⏳ Между отправками: 3 минуты\n\n"
-            "👇 Жду твоё сообщение...",
-            parse_mode="Markdown")
+            "👇 Жду твоё сообщение..."
+        )
+        if query.message and query.message.photo:
+            try:
+                await query.edit_message_caption(caption=anon_prompt, parse_mode="Markdown")
+            except Exception:
+                await query.message.reply_text(anon_prompt, parse_mode="Markdown")
+        else:
+            await query.edit_message_text(anon_prompt, parse_mode="Markdown")
 
     elif data == "menu_top":
         await query.edit_message_text(build_top_text(), reply_markup=top_keyboard(uid))
