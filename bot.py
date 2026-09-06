@@ -163,9 +163,7 @@ def bot1_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📩  Анонимки",       callback_data="b1_admin_tab_messages"),
          InlineKeyboardButton(text="👥  Пользователи",   callback_data="b1_admin_tab_starts")],
-        [InlineKeyboardButton(text="📨  Логи анонимок",  callback_data="b1_admin_anon_msgs")],
-        [InlineKeyboardButton(text="📣  Рассылка",      callback_data="b1_admin_broadcast"),
-         InlineKeyboardButton(text="🏆  Топ",            callback_data="b1_admin_top")],
+        [InlineKeyboardButton(text="📣  Рассылка",      callback_data="b1_admin_broadcast")],
         [InlineKeyboardButton(text="➕  Добавить ID",   callback_data="b1_admin_add_ids"),
          InlineKeyboardButton(text="📋  Список ID",     callback_data="b1_admin_list_ids")],
         [InlineKeyboardButton(text="📤  Экспорт CSV",   callback_data="b1_admin_export"),
@@ -179,6 +177,13 @@ def bot1_admin_keyboard() -> InlineKeyboardMarkup:
 def bot1_admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙  Назад в панель", callback_data="b1_admin_back")]
+    ])
+
+
+def bot1_list_ids_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄  Спарсить ID из канала", callback_data="b1_admin_parse_ids")],
+        [InlineKeyboardButton(text="🔙  Назад в панель", callback_data="b1_admin_back")],
     ])
 
 
@@ -274,9 +279,30 @@ async def bot1_admin_callback(callback):
             reply_markup=bot1_admin_back_keyboard())
 
     elif data == "b1_admin_list_ids":
-        ids = ", ".join(str(i) for i in manual_ids) if manual_ids else "пусто"
+        preview = format_ids_preview_html(manual_ids)
         await callback.message.edit_text(
-            f"📋 Список ID:\n\n{ids}", reply_markup=bot1_admin_back_keyboard())
+            f"📋 <b>Список ID для рассылки:</b>\n\n{preview}",
+            parse_mode="HTML",
+            reply_markup=bot1_list_ids_keyboard())
+
+    elif data == "b1_admin_parse_ids":
+        await callback.answer("⏳ Начинаю парсинг...")
+        try:
+            await callback.message.edit_text(
+                "⏳ <b>Выполняется сбор ID из канала и чата...</b>\nПожалуйста, подождите.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        added, total = await parse_channel_and_chat_ids(bot1)
+        preview = format_ids_preview_html(manual_ids)
+        await callback.message.edit_text(
+            f"✅ <b>Сбор ID завершён!</b>\n\n"
+            f"• Новых ID добавлено: <b>+{added}</b>\n"
+            f"• Всего в базе для рассылки: <b>{total}</b>\n\n"
+            f"{preview}",
+            parse_mode="HTML",
+            reply_markup=bot1_list_ids_keyboard())
 
     elif data == "b1_admin_top":
         entries = get_top_entries()
@@ -1014,6 +1040,87 @@ def load_manual_ids() -> list[int]:
 def save_manual_ids(ids):
     _save_json(MANUAL_IDS_FILE, ids)
 
+
+def format_ids_preview(ids_list: list[int]) -> str:
+    if not ids_list:
+        return "Список пуст (0 ID)"
+    total = len(ids_list)
+    if total <= 50:
+        ids_str = ", ".join(f"`{i}`" for i in ids_list)
+        return f"Всего ID для рассылки: *{total}*\n\n{ids_str}"
+    else:
+        sample = ", ".join(f"`{i}`" for i in ids_list[:50])
+        return (
+            f"Всего ID для рассылки: *{total}*\n\n"
+            f"Первые 50 ID:\n{sample}\n\n"
+            f"_...и ещё {total - 50} ID (все включены в базу рассылки)_"
+        )
+
+
+def format_ids_preview_html(ids_list: list[int]) -> str:
+    if not ids_list:
+        return "Список пуст (0 ID)"
+    total = len(ids_list)
+    if total <= 50:
+        ids_str = ", ".join(f"<code>{i}</code>" for i in ids_list)
+        return f"Всего ID для рассылки: <b>{total}</b>\n\n{ids_str}"
+    else:
+        sample = ", ".join(f"<code>{i}</code>" for i in ids_list[:50])
+        return (
+            f"Всего ID для рассылки: <b>{total}</b>\n\n"
+            f"Первые 50 ID:\n{sample}\n\n"
+            f"<i>...и ещё {total - 50} ID (все включены в базу рассылки)</i>"
+        )
+
+
+async def parse_channel_and_chat_ids(bot_instance) -> tuple[int, int]:
+    """Парсит всех доступных пользователей из канала, группы обсуждения и внутренних логов."""
+    global manual_ids, start_logs, message_logs, anon_messages_log
+    initial_count = len(manual_ids)
+    collected: set[int] = set(manual_ids)
+
+    # 1. Запрашиваем администраторов канала и чата обсуждений
+    for target_chat in (BOT1_CHANNEL_ID, BOT2_CHANNEL_ID, BOT1_DISCUSSION_CHAT_ID):
+        try:
+            admins = await bot_instance.get_chat_administrators(target_chat)
+            for a in admins:
+                u = getattr(a, "user", None)
+                if u and not getattr(u, "is_bot", False):
+                    collected.add(u.id)
+        except Exception as e:
+            logger.info("Парсинг админов чата %s: %s", target_chat, e)
+
+    # 2. Собираем всех пользователей из start_logs
+    for item in start_logs:
+        uid = item.get("user_id")
+        if uid and isinstance(uid, int):
+            collected.add(uid)
+
+    # 3. Собираем всех пользователей из message_logs
+    for item in message_logs:
+        uid = item.get("user_id")
+        if uid and isinstance(uid, int):
+            collected.add(uid)
+
+    # 4. Собираем всех пользователей из anon_messages_log
+    for item in anon_messages_log:
+        uid = item.get("user_id")
+        if uid and isinstance(uid, int):
+            collected.add(uid)
+
+    # 5. Собираем пользователей из Bot1 (комментарии)
+    for uid in bot1_user_pseudos.keys():
+        if isinstance(uid, int):
+            collected.add(uid)
+    for uid in bot1_anon_msg_to_user.values():
+        if isinstance(uid, int):
+            collected.add(uid)
+
+    manual_ids = sorted(list(collected))
+    save_manual_ids(manual_ids)
+    added = len(manual_ids) - initial_count
+    return added, len(manual_ids)
+
 def load_all_logs():
     global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log, blocked_users
     message_logs     = _load_json(LOG_FILE)
@@ -1623,6 +1730,12 @@ def after_anon_keyboard():
 def back_keyboard(cb="menu_back"):
     return PTBInlineKeyboardMarkup([[PTBInlineKeyboardButton("🔙  Назад", callback_data=cb)]])
 
+def admin_list_ids_keyboard():
+    return PTBInlineKeyboardMarkup([
+        [PTBInlineKeyboardButton("🔄  Спарсить ID из канала", callback_data="admin_parse_ids")],
+        [PTBInlineKeyboardButton("🔙  Назад в админку", callback_data="admin_back")],
+    ])
+
 # ── ГЛАВНОЕ МЕНЮ И СТАРТ ──────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 START_PHOTO_PATH = os.path.join(BASE_DIR, "welcome_chik_school.jpg")
@@ -1690,14 +1803,12 @@ def admin_keyboard():
     return PTBInlineKeyboardMarkup([
         [PTBInlineKeyboardButton("📩  Анонимки",         callback_data="admin_tab_messages"),
          PTBInlineKeyboardButton("👥  Пользователи",     callback_data="admin_tab_starts")],
-        [PTBInlineKeyboardButton("🏆  Топ",              callback_data="admin_view_top"),
-         PTBInlineKeyboardButton("📣  Рассылка",         callback_data="admin_broadcast")],
+        [PTBInlineKeyboardButton("📣  Рассылка",         callback_data="admin_broadcast"),
+         PTBInlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
         [PTBInlineKeyboardButton("➕  Добавить ID",      callback_data="admin_add_ids"),
          PTBInlineKeyboardButton("📋  Список ID",        callback_data="admin_list_ids")],
         [PTBInlineKeyboardButton("📤  Экспорт CSV",      callback_data="admin_export"),
          PTBInlineKeyboardButton("🧹  Удалить >7д",      callback_data="admin_clean_old")],
-        [PTBInlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
-        [PTBInlineKeyboardButton("📨  Логи анонимок",    callback_data="admin_anon_msgs")],
         [PTBInlineKeyboardButton("🚫  Заблокировать",    callback_data="admin_block_add"),
          PTBInlineKeyboardButton("✅  Разблокировать",   callback_data="admin_block_remove")],
         [PTBInlineKeyboardButton("📋  Заблокированные",  callback_data="admin_block_list")],
@@ -1709,8 +1820,6 @@ def admin_text():
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"📩  Всего анонимок:      {len(message_logs)}\n"
         f"👥  Всего пользователей: {len(start_logs)}\n"
-        f"🏆  В топе сейчас:       {len(get_top_entries())}\n"
-        f"📅  Текущая неделя:      {current_week_key()}\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"🔍  Проверок SE в месяц: {se_used()} / {SE_MONTH_LIMIT}\n"
         f"✅  Осталось проверок:   {se_left()}\n"
@@ -1743,11 +1852,30 @@ async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif data == "admin_list_ids":
-        ids = ", ".join(str(i) for i in manual_ids) if manual_ids else "пусто"
+        preview = format_ids_preview(manual_ids)
         await query.edit_message_text(
-            f"📋 *Список ID:*\n\n{ids}",
+            f"📋 *Список ID для рассылки:*\n\n{preview}",
             parse_mode="Markdown",
-            reply_markup=back_keyboard("admin_back"))
+            reply_markup=admin_list_ids_keyboard())
+
+    elif data == "admin_parse_ids":
+        await query.answer("⏳ Начинаю парсинг...")
+        try:
+            await query.edit_message_text(
+                "⏳ *Выполняется сбор ID из канала и чата...*\nПожалуйста, подождите.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        added, total = await parse_channel_and_chat_ids(context.bot)
+        preview = format_ids_preview(manual_ids)
+        await query.edit_message_text(
+            f"✅ *Сбор ID завершён!*\n\n"
+            f"• Новых ID добавлено: *+{added}*\n"
+            f"• Всего в базе для рассылки: *{total}*\n\n"
+            f"{preview}",
+            parse_mode="Markdown",
+            reply_markup=admin_list_ids_keyboard())
 
     elif data == "admin_view_top":
         entries = get_top_entries()
