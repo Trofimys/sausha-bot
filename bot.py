@@ -69,8 +69,12 @@ BOT2_CHANNEL_ID       = int(os.environ.get("BOT2_CHANNEL_ID", "-1003854171715"))
 BOT2_USERNAME         = os.environ.get("BOT2_USERNAME", "Shkola6_anonchik_bot")  # имя бота 2
 BOT2_CHAT_INVITE      = os.environ.get("BOT2_CHAT_INVITE", "https://t.me/+N1hmM9BYc1VkZWQ1")  # ссылка на чат
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8627543263"))
-MODERATION_LOG_CHANNEL_ID = int(os.environ.get("MODERATION_LOG_CHANNEL_ID", "-1003911650264"))
-MODERATION_LOG_CHANNEL_LINK = os.environ.get("MODERATION_LOG_CHANNEL_LINK", "https://t.me/drsgdfg")
+
+# ── Модерация логов: делаем опциональной ──
+_mod_log_raw = os.environ.get("MODERATION_LOG_CHANNEL_ID")
+MODERATION_LOG_CHANNEL_ID = int(_mod_log_raw) if _mod_log_raw else None
+MODERATION_LOG_CHANNEL_LINK = os.environ.get("MODERATION_LOG_CHANNEL_LINK", "")
+
 SE_USER               = "422568370"  # зашито напрямую по просьбе
 SE_SECRET             = "bhCjTco48ZpWVtMHftGedNpgyYAWJsvd"  # зашито напрямую по просьбе
 SE_MONTH_LIMIT        = int(os.environ.get("SE_MONTH_LIMIT", "2000"))
@@ -533,8 +537,6 @@ async def bot1_on_channel_post(message: Message):
     post_id = message.message_id
     logger.info(f"[Bot1] Новый пост: {post_id}")
 
-    # Ждём форвард в дискуссию (до 15 секунд, проверяем каждые 2 сек)
-    # Это лучше чем просто sleep(5), т.к. не блокирует надолго при быстром форварде
     for _ in range(8):
         if post_id in bot1_post_to_discussion_id:
             break
@@ -586,7 +588,6 @@ async def bot1_on_discussion_reply(message: Message):
 
     original_author_id = bot1_anon_msg_to_user[replied_to_id]
 
-    # Не уведомляем если человек ответил сам себе
     if message.from_user.id == original_author_id:
         return
 
@@ -642,7 +643,6 @@ async def bot1_cmd_start(message: Message, state: FSMContext):
             await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
             return
 
-        # ── Проверка подписки на чат ──
         bot_username = await bot1_get_username()
         if not await bot1_check_subscription(message.from_user.id):
             await bot1_send_sub_required(message, bot_username, param)
@@ -669,7 +669,6 @@ async def bot1_cmd_cancel(message: Message, state: FSMContext):
     await message.answer("❌ Отправка отменена.")
 
 
-# ── Проверка подписки на чат (Bot1) ──
 async def bot1_check_subscription(user_id: int) -> bool:
     """Возвращает True если пользователь подписан на BOT1_DISCUSSION_CHAT_ID."""
     try:
@@ -677,7 +676,7 @@ async def bot1_check_subscription(user_id: int) -> bool:
         return member.status not in ("left", "kicked", "banned")
     except Exception as e:
         logger.warning(f"[Bot1] Не удалось проверить подписку для {user_id}: {e}")
-        return True  # при ошибке — не блокируем
+        return True
 
 
 async def bot1_send_sub_required(message: Message, bot_username: str, param: str):
@@ -697,7 +696,6 @@ async def bot1_send_sub_required(message: Message, bot_username: str, param: str
     )
 
 
-# ── Уведомление админа о том, кто написал анонимный комментарий (Bot1) ──
 async def bot1_notify_admin(message: Message, post_id: int, content_type: str, caption_text: str, pseudo: str):
     u = message.from_user
     ustr = f"@{u.username}" if u.username else "—"
@@ -721,7 +719,6 @@ async def bot1_notify_admin(message: Message, post_id: int, content_type: str, c
         logger.warning(f"[Bot1] Не удалось уведомить админа: {e}")
 
 
-# ── Общая функция отправки анонимного комментария (любой тип) ──
 async def send_anon_comment(
     message: Message,
     state: FSMContext,
@@ -744,11 +741,9 @@ async def send_anon_comment(
         await message.answer("❌ Ошибка. Нажми кнопку под постом снова.")
         return
 
-    # ── Проверка подписки при каждой отправке анонимки ──
     if not await bot1_check_subscription(user_id):
         post_id_tmp, _ = data
         bot_username = await bot1_get_username()
-        # Определяем param для кнопки «проверить»
         discussion_msg_id = bot1_post_to_discussion_id.get(post_id_tmp)
         param = f"reply_{discussion_msg_id}" if discussion_msg_id else f"post_{post_id_tmp}"
         await state.clear()
@@ -842,8 +837,6 @@ async def send_anon_comment(
         bot1_pending.pop(user_id, None)
         await message.answer("❌ Произошла ошибка. Попробуй позже.")
 
-
-# ── Хендлеры для разных типов контента ──
 
 @bot1_dp.message(AnonState.waiting_text, F.text)
 async def handle_text(message: Message, state: FSMContext):
@@ -1609,9 +1602,7 @@ async def send_to_channel(context, update, text) -> int | None:
     Одно сообщение в канал:
       📩 Анонимное сообщение
       ✉️ Отправить анонимку (ссылка на бота, без превью)
-
       Само анон сообщение
-
       вейп барахолка и по совместительству чат шiкунчиков (ссылка на чат, без превью)
     """
     msg = update.message
@@ -1619,10 +1610,8 @@ async def send_to_channel(context, update, text) -> int | None:
 
     bot_link = f"https://t.me/{BOT2_USERNAME}"
     safe = escape_mdv2(text) if text else ""
-    # chat_link НЕ экранируем — ссылка должна остаться рабочей внутри []()
     chat_link = BOT2_CHAT_INVITE
 
-    # > в начале строки = цитированный блок (зелёная полоска), ссылка внутри кликабельна
     header = (
         f"*📩 Анонимное сообщение*\n"
         f">[🔴 Отправить анонимку]({bot_link})"
@@ -1710,7 +1699,7 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
     except Exception as e:
         logger.error("Админ-уведомление: %s", e)
 
-    if blocked_reason:
+    if blocked_reason and MODERATION_LOG_CHANNEL_ID:
         log_msg_id = await post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason)
         if log_msg_id:
             await announce_blocked_in_main_channel(context, log_msg_id)
@@ -1718,6 +1707,8 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
 
 async def announce_blocked_in_main_channel(context, log_msg_id: int):
     """В основной канал — только анонс со ссылкой на пост в канале логов."""
+    if not MODERATION_LOG_CHANNEL_LINK:
+        return
     link = f"{MODERATION_LOG_CHANNEL_LINK.rstrip('/')}/{log_msg_id}"
     try:
         await context.bot.send_message(
@@ -1732,6 +1723,9 @@ async def announce_blocked_in_main_channel(context, log_msg_id: int):
 
 async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason) -> int | None:
     """Дублирует карточку заблокированного контента в канал логов — без данных автора."""
+    if not MODERATION_LOG_CHANNEL_ID:
+        return None
+        
     lines = [
         "🚫 *ЗАБЛОКИРОВАНО*",
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
@@ -2305,7 +2299,7 @@ def _log_blocked(uid, update, ctype, text, reason, now):
         "blocked": reason,
     })
 
-# ── ИИ-ЧАТ БОТА 2 ────────────────────────
+# ── ИИ-ЧАТ БОТА 2 (отключен) ────────────────────────
 async def handle_ai_chat(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     inp = update.message.text
     if not inp:
