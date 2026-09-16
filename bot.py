@@ -40,9 +40,8 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ═══════════════════════════════════════════════════════════════════
-# КОНФИГУРАЦИЯ (берём из переменных окружения, с fallback на дефолт)
+# КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════════════
-
 
 def _load_env_file() -> None:
     for p in (".env", "../.env"):
@@ -71,7 +70,6 @@ BOT2_USERNAME         = os.environ.get("BOT2_USERNAME", "podslushka67972_bot")
 BOT2_CHAT_INVITE      = os.environ.get("BOT2_CHAT_INVITE", "https://t.me/+D8BJn_6hc41lOGMx")
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8627543263"))
 
-# ── Модерация логов: делаем опциональной ──
 _mod_log_raw = os.environ.get("MODERATION_LOG_CHANNEL_ID")
 MODERATION_LOG_CHANNEL_ID = int(_mod_log_raw) if _mod_log_raw else None
 MODERATION_LOG_CHANNEL_LINK = os.environ.get("MODERATION_LOG_CHANNEL_LINK", "")
@@ -99,10 +97,6 @@ if not BOT1_TOKEN or not BOT2_TOKEN:
         "Не заданы BOT1_TOKEN / BOT2_TOKEN. "
         "Задайте переменные окружения или создайте файл .env"
     )
-
-# ═══════════════════════════════════════════════════════════════════
-# ЛОГИРОВАНИЕ
-# ═══════════════════════════════════════════════════════════════════
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -156,10 +150,13 @@ def bot1_get_pseudo(user_id: int, post_id: int) -> str:
     return bot1_user_pseudos[user_id][post_id]
 
 def bot1_admin_keyboard() -> InlineKeyboardMarkup:
+    auto_icon = "🟢" if auto_approve_enabled else "🔴"
+    auto_text = f"{auto_icon}  Автопринятие заявок: {'ВКЛ' if auto_approve_enabled else 'ВЫКЛ'}"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📩  Анонимки",       callback_data="b1_admin_tab_messages")],
         [InlineKeyboardButton(text="📣  Рассылка",      callback_data="b1_admin_broadcast")],
         [InlineKeyboardButton(text="📋  Список ID",     callback_data="b1_admin_list_ids")],
+        [InlineKeyboardButton(text=auto_text,            callback_data="b1_admin_toggle_auto")],
         [InlineKeyboardButton(text="📤  Экспорт CSV",   callback_data="b1_admin_export"),
          InlineKeyboardButton(text="🧹  Удалить >7д",   callback_data="b1_admin_clean_old")],
         [InlineKeyboardButton(text="🚫  Заблокировать", callback_data="b1_admin_block_add"),
@@ -245,7 +242,7 @@ async def bot1_show_anon_messages_page(callback, page):
 
 @bot1_dp.callback_query(F.data.startswith("b1_admin"))
 async def bot1_admin_callback(callback):
-    global message_logs
+    global message_logs, auto_approve_enabled
     uid = callback.from_user.id
     data = callback.data
     if uid != ADMIN_ID:
@@ -346,6 +343,12 @@ async def bot1_admin_callback(callback):
     elif data == "b1_admin_block_list":
         await callback.message.edit_text(
             build_blocked_list_text(), reply_markup=bot1_admin_back_keyboard())
+    elif data == "b1_admin_toggle_auto":
+        auto_approve_enabled = not auto_approve_enabled
+        save_settings()
+        status = "включено 🟢" if auto_approve_enabled else "выключено 🔴"
+        await callback.answer(f"Автопринятие заявок {status}", show_alert=True)
+        await callback.message.edit_text(admin_text(), reply_markup=bot1_admin_keyboard())
     elif data == "b1_admin_back":
         bot1_admin_state.pop(uid, None)
         await callback.message.edit_text(admin_text(), reply_markup=bot1_admin_keyboard())
@@ -465,9 +468,11 @@ async def bot1_on_discussion_forward(message: Message):
 # ── Автопринятие заявок в закрытый канал (Bot1) ──
 @bot1_dp.chat_join_request()
 async def bot1_auto_approve_join(request: ChatJoinRequest):
-    """Автоматически одобряет все заявки на вступление в канал."""
     user_id = request.from_user.id
     chat_id = request.chat.id
+    if not auto_approve_enabled:
+        logger.info(f"[Bot1] ⏸ Автопринятие выключено, заявка {user_id} → {chat_id} проигнорирована")
+        return
     try:
         await request.approve()
         logger.info(f"[Bot1] ✅ Автопринятие заявки: {user_id} → {chat_id}")
@@ -848,7 +853,6 @@ async def handle_sticker(message: Message, state: FSMContext):
 # БОТ 2: АНОНИМНЫЕ СООБЩЕНИЯ В КАНАЛ + АДМИНКА
 # ═══════════════════════════════════════════════════════════════════
 
-# ── ВЕБ-СЕРВЕР (keep-alive) ──────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -876,7 +880,6 @@ async def _keep_alive():
             pass
         await asyncio.sleep(540)
 
-# ── ПРОМПТЫ ───────────────────────────────
 SYSTEM_PROMPT = """
 Ты — живой, интересный собеседник с лёгким характером. Твоя цель — приятное и естественное общение.
 Ты не используешь шаблонные фразы и не повторяешь заученные ответы.
@@ -893,13 +896,13 @@ CONTENT_CHECK_PROMPT = """
 Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
 """.strip()
 
-# ── ФАЙЛЫ И ДАННЫЕ ────────────────────────
 LOG_FILE           = "anon_logs.json"
 START_LOG_FILE     = "start_logs.json"
 MANUAL_IDS_FILE    = "manual_ids.json"
 TOP_FILE           = "top_data.json"
 ANON_MSGS_LOG_FILE = "anon_messages_log.json"
 BLOCKED_FILE       = "blocked_users.json"
+SETTINGS_FILE      = "settings.json"
 
 COOLDOWN_SECONDS = 180
 ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
@@ -915,8 +918,9 @@ top_data: dict = {}
 se_checks_month: dict = {}
 anon_messages_log: list[dict] = []
 blocked_users: dict = {}
+# Глобальный флаг: включено ли автопринятие заявок в закрытый канал
+auto_approve_enabled: bool = True
 
-# ── SIGHTENGINE ───────────────────────────
 def se_increment(n: int = 1):
     key = datetime.now().strftime("%Y-%m")
     se_checks_month[key] = se_checks_month.get(key, 0) + n
@@ -929,7 +933,6 @@ def se_used() -> int:
 def se_left() -> int:
     return max(0, SE_MONTH_LIMIT - se_used())
 
-# ── УТИЛИТЫ ───────────────────────────────
 _MDV2 = re.compile(r'([_*\[\]()~`>#+=|{}.!\\-])')
 
 def escape_mdv2(t: str) -> str:
@@ -962,7 +965,6 @@ def _save_json(path, data):
     except Exception as e:
         logger.error("Ошибка записи %s: %s", path, e)
 
-# ── ЗАГРУЗКА ДАННЫХ ───────────────────────
 def current_week_key() -> str:
     today = datetime.now()
     return (today - timedelta(days=today.weekday())).strftime("%Y-W%V")
@@ -1129,6 +1131,15 @@ async def parse_channel_and_chat_ids(bot_instance) -> dict:
         "chats": chat_info,
     }
 
+def load_settings():
+    global auto_approve_enabled
+    data = _load_json_dict(SETTINGS_FILE)
+    if "auto_approve" in data:
+        auto_approve_enabled = bool(data["auto_approve"])
+
+def save_settings():
+    _save_json(SETTINGS_FILE, {"auto_approve": auto_approve_enabled})
+
 def load_all_logs():
     global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log, blocked_users
     message_logs     = _load_json(LOG_FILE)
@@ -1139,6 +1150,7 @@ def load_all_logs():
     se_checks_month  = _load_json_dict("se_checks.json")
     anon_messages_log = _load_json(ANON_MSGS_LOG_FILE)
     blocked_users    = _load_json_dict(BLOCKED_FILE)
+    load_settings()
 
 load_all_logs()
 
@@ -1167,7 +1179,6 @@ def add_start_log(uid, uname, fn, ln):
         manual_ids.append(uid)
         save_manual_ids(manual_ids)
 
-# ── ТОП ───────────────────────────────────
 def get_top_entries() -> list[dict]:
     week = current_week_key()
     res = [{"user_id": int(k), "nick": v.get("nick", "Аноним"), "count": v.get("count", 0)}
@@ -1220,7 +1231,6 @@ def leave_top(uid: int):
         del top_data[k]
         _save_json(TOP_FILE, top_data)
 
-# ── БЛОК-ЛИСТ (общий для bot1 и bot2) ─────
 def is_user_blocked(uid: int) -> bool:
     return str(uid) in blocked_users
 
@@ -1299,7 +1309,42 @@ def build_top_text() -> str:
     lines.append("▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔")
     return "\n".join(lines)
 
-# ── SIGHTENGINE МОДЕРАЦИЯ ─────────────────
+# ── SIGHTENGINE МОДЕРАЦИЯ (nudity + offensive + gore) ─────────────────
+SE_MODELS = "nudity-2.1,offensive,gore"
+
+def _extract_se_scores(data: dict) -> tuple[float, float, float]:
+    """Возвращает (sexual_score, offensive_score, gore_score)."""
+    nudity = data.get("nudity", {}) or {}
+    sexual_score = max(
+        nudity.get("sexual_activity", 0) or 0,
+        nudity.get("sexual_display", 0) or 0,
+        nudity.get("erotica", 0) or 0,
+        nudity.get("very_suggestive", 0) or 0,
+        nudity.get("suggestive", 0) or 0,
+        nudity.get("mildly_suggestive", 0) or 0,
+    )
+    offensive_score = (data.get("offensive", {}) or {}).get("prob", 0) or 0
+    gore = data.get("gore", {}) or {}
+    gore_score = max(
+        gore.get("very_probable", 0) or 0,
+        gore.get("probable", 0) or 0,
+        gore.get("slightly_probable", 0) or 0,
+        gore.get("prob", 0) or 0,
+    )
+    return sexual_score, offensive_score, gore_score
+
+
+def _check_se_result(sexual_score: float, offensive_score: float, gore_score: float) -> tuple[bool, str]:
+    """Проверяет три счёта и возвращает результат модерации."""
+    if gore_score > 0.2:
+        return False, f"расчленёнка / кровь / жестокость ({int(gore_score * 100)}%)"
+    if sexual_score > 0.2:
+        return False, f"сексуальный контент ({int(sexual_score * 100)}%)"
+    if offensive_score > 0.7:
+        return False, f"оскорбительный контент ({int(offensive_score * 100)}%)"
+    return True, ""
+
+
 async def _get_tg_file_url(bot, file_id: str) -> str | None:
     try:
         tg_file = await bot.get_file(file_id)
@@ -1318,7 +1363,7 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
             r = await client.post(
                 "https://api.sightengine.com/1.0/check.json",
                 data={
-                    "models": "nudity-2.1,offensive",
+                    "models": SE_MODELS,
                     "api_user": SE_USER,
                     "api_secret": SE_SECRET,
                 },
@@ -1328,23 +1373,10 @@ async def _sightengine_check_bytes(image_bytes: bytes) -> tuple[bool, str]:
             logger.error("Sightengine error: %s", r.text)
             return True, ""
         data = r.json()
-        nudity = data.get("nudity", {})
-        sexual_score = max(
-            nudity.get("sexual_activity", 0),
-            nudity.get("sexual_display", 0),
-            nudity.get("erotica", 0),
-            nudity.get("very_suggestive", 0),
-            nudity.get("suggestive", 0),
-            nudity.get("mildly_suggestive", 0),
-        )
-        offensive = data.get("offensive", {}).get("prob", 0)
-        logger.info("Sightengine: sexual=%.2f offensive=%.2f", sexual_score, offensive)
+        sexual, offensive, gore = _extract_se_scores(data)
+        logger.info("Sightengine bytes: sexual=%.2f offensive=%.2f gore=%.2f", sexual, offensive, gore)
         se_increment(1)
-        if sexual_score > 0.2:
-            return False, f"сексуальный контент ({int(sexual_score * 100)}%)"
-        if offensive > 0.7:
-            return False, f"оскорбительный контент ({int(offensive * 100)}%)"
-        return True, ""
+        return _check_se_result(sexual, offensive, gore)
     except Exception as e:
         logger.error("Sightengine bytes check error: %s", e)
         return True, ""
@@ -1411,7 +1443,7 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
                 "https://api.sightengine.com/1.0/check.json",
                 params={
                     "url": url,
-                    "models": "nudity-2.1,offensive",
+                    "models": SE_MODELS,
                     "api_user": SE_USER,
                     "api_secret": SE_SECRET,
                 }
@@ -1420,23 +1452,10 @@ async def is_image_acceptable(bot, file_id: str) -> tuple[bool, str]:
             logger.error("Sightengine error: %s", r.text)
             return True, ""
         data = r.json()
-        nudity = data.get("nudity", {})
-        sexual_score = max(
-            nudity.get("sexual_activity", 0),
-            nudity.get("sexual_display", 0),
-            nudity.get("erotica", 0),
-            nudity.get("very_suggestive", 0),
-            nudity.get("suggestive", 0),
-            nudity.get("mildly_suggestive", 0),
-        )
-        offensive = data.get("offensive", {}).get("prob", 0)
-        logger.info("Sightengine фото: sexual=%.2f offensive=%.2f", sexual_score, offensive)
+        sexual, offensive, gore = _extract_se_scores(data)
+        logger.info("Sightengine фото: sexual=%.2f offensive=%.2f gore=%.2f", sexual, offensive, gore)
         se_increment(1)
-        if sexual_score > 0.2:
-            return False, f"сексуальный контент (уверенность {int(sexual_score * 100)}%)"
-        if offensive > 0.7:
-            return False, f"оскорбительный контент (уверенность {int(offensive * 100)}%)"
-        return True, ""
+        return _check_se_result(sexual, offensive, gore)
     except Exception as e:
         logger.error("Ошибка проверки изображения Sightengine: %s", e)
         return True, ""
@@ -1477,7 +1496,7 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                         r = await client.post(
                             "https://api.sightengine.com/1.0/check.json",
                             data={
-                                "models": "nudity-2.1,offensive",
+                                "models": SE_MODELS,
                                 "api_user": SE_USER,
                                 "api_secret": SE_SECRET,
                             },
@@ -1485,22 +1504,12 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
                         )
                 if r.status_code == 200:
                     data = r.json()
-                    nudity = data.get("nudity", {})
-                    sexual_score = max(
-                        nudity.get("sexual_activity", 0),
-                        nudity.get("sexual_display", 0),
-                        nudity.get("erotica", 0),
-                        nudity.get("very_suggestive", 0),
-                        nudity.get("suggestive", 0),
-                        nudity.get("mildly_suggestive", 0),
-                    )
-                    offensive = data.get("offensive", {}).get("prob", 0)
-                    logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f", sec, sexual_score, offensive)
+                    sexual, offensive, gore = _extract_se_scores(data)
+                    logger.info("Видео кадр %d: sexual=%.2f offensive=%.2f gore=%.2f", sec, sexual, offensive, gore)
                     se_increment(1)
-                    if sexual_score > 0.2:
-                        return False, f"сексуальный контент на {sec}-й секунде ({int(sexual_score * 100)}%)"
-                    if offensive > 0.7:
-                        return False, f"оскорбительный контент на {sec}-й секунде ({int(offensive * 100)}%)"
+                    ok, reason = _check_se_result(sexual, offensive, gore)
+                    if not ok:
+                        return False, f"{reason} (кадр {sec}с)"
             except Exception as e:
                 logger.error("Ошибка Sightengine кадр %d: %s", sec, e)
             finally:
@@ -1515,13 +1524,11 @@ async def is_video_acceptable(bot, file_id: str) -> tuple[bool, str]:
         if video_path and os.path.exists(video_path):
             os.unlink(video_path)
 
-# ── МОДЕРАЦИЯ ТЕКСТА ──────────────────────
 async def is_content_acceptable(text: str) -> tuple[bool, str]:
     if not text or len(text.strip()) < 2:
         return False, "слишком короткое"
     return True, ""
 
-# ── АНИМАЦИЯ ПЕЧАТАНИЯ ────────────────────
 async def typewriter_reply(update: Update, full_text: str):
     if not full_text:
         return
@@ -1537,7 +1544,6 @@ async def typewriter_reply(update: Update, full_text: str):
                 pass
         await asyncio.sleep(TYPING_DELAY)
 
-# ── ОТПРАВКА В КАНАЛ ──────────────────────
 async def send_to_channel(context, update, text) -> int | None:
     msg = update.message
     bot = context.bot
@@ -1588,7 +1594,6 @@ async def send_to_channel(context, update, text) -> int | None:
         logger.error("send_to_channel: %s", e)
         return None
 
-# ── УВЕДОМЛЕНИЕ АДМИНА ────────────────────
 async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None):
     u = update.effective_user
     ustr = f"`@{u.username}`" if u.username else "—"
@@ -1689,7 +1694,6 @@ async def post_blocked_to_log_channel(context, update, ctype, ctext, blocked_rea
         logger.error("Лог модерации в канал: %s", e)
         return None
 
-# ── КЛАВИАТУРЫ ────────────────────────────
 def main_keyboard():
     return PTBInlineKeyboardMarkup([
         [PTBInlineKeyboardButton("🔴  Отправить анонимку", callback_data="menu_anon", api_kwargs={"style": "danger"})],
@@ -1731,7 +1735,6 @@ def admin_list_ids_keyboard():
         [PTBInlineKeyboardButton("🔙  Назад в админку", callback_data="admin_back")],
     ])
 
-# ── ГЛАВНОЕ МЕНЮ И СТАРТ ──────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 START_PHOTO_PATH = os.path.join(BASE_DIR, "welcome_chik_school.jpg")
 START_CAPTION = "Нажми на кнопку ниже, чтобы отправить анонимку 👇"
@@ -1760,7 +1763,6 @@ async def main_menu(update: Update, context: PTBContextTypes.DEFAULT_TYPE, edit=
             logger.error("Ошибка отправки start photo в main_menu: %s", e)
     await context.bot.send_message(chat_id, START_CAPTION, reply_markup=kb)
 
-# ── КОМАНДЫ БОТА 2 ────────────────────────
 async def bot2_cmd_start(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     add_start_log(u.id, u.username, u.first_name, u.last_name)
@@ -1793,13 +1795,15 @@ async def bot2_cmd_cancel(update: Update, context: PTBContextTypes.DEFAULT_TYPE)
               or context.user_data.pop("awaiting_block_remove", None))
     await update.message.reply_text("✅ Отменено." if popped else "Нечего отменять.")
 
-# ── АДМИН-ПАНЕЛЬ ──────────────────────────
 def admin_keyboard():
+    auto_icon = "🟢" if auto_approve_enabled else "🔴"
+    auto_text = f"{auto_icon}  Автопринятие заявок: {'ВКЛ' if auto_approve_enabled else 'ВЫКЛ'}"
     return PTBInlineKeyboardMarkup([
         [PTBInlineKeyboardButton("📩  Анонимки",         callback_data="admin_tab_messages")],
         [PTBInlineKeyboardButton("📣  Рассылка",         callback_data="admin_broadcast"),
          PTBInlineKeyboardButton("🧪  Тест ИИ модерации", callback_data="admin_test_ai")],
         [PTBInlineKeyboardButton("📋  Список ID",        callback_data="admin_list_ids")],
+        [PTBInlineKeyboardButton(auto_text,               callback_data="admin_toggle_auto")],
         [PTBInlineKeyboardButton("📤  Экспорт CSV",      callback_data="admin_export"),
          PTBInlineKeyboardButton("🧹  Удалить >7д",      callback_data="admin_clean_old")],
         [PTBInlineKeyboardButton("🚫  Заблокировать",    callback_data="admin_block_add"),
@@ -1808,12 +1812,14 @@ def admin_keyboard():
     ])
 
 def admin_text():
+    auto_status = "🟢 включено" if auto_approve_enabled else "🔴 выключено"
     return (
         "👑 АДМИН-ПАНЕЛЬ\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"📩  Всего анонимок:      {len(message_logs)}\n"
         f"👥  Всего пользователей: {len(start_logs)}\n"
         f"📋  В базе рассылки:     {len(manual_ids)} ID\n"
+        f"🚪  Автопринятие заявок: {auto_status}\n"
         "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
         f"🔍  Проверок SE в месяц: {se_used()} / {SE_MONTH_LIMIT}\n"
         f"✅  Осталось проверок:   {se_left()}\n"
@@ -1827,6 +1833,7 @@ async def bot2_cmd_admin(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(admin_text(), reply_markup=admin_keyboard())
 
 async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
+    global auto_approve_enabled
     query = update.callback_query
     data = query.data
     if update.effective_user.id != ADMIN_ID:
@@ -1909,7 +1916,7 @@ async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_test_media"] = True
         await query.edit_message_text(
             "🧪 *Тест ИИ модерации*\n\n"
-            "Отправь фото, видео, GIF или стикер — я проверю через Sightengine и скажу:\n"
+            "Отправь фото, видео, GIF или стикер — я проверю через Sightengine (nudity + offensive + gore) и скажу:\n"
             "✅ пропустил бы в канал или 🚫 заблокировал бы\n\n"
             "_(в канал ничего не отправляется)_\n\n"
             "/cancel — отмена",
@@ -1941,6 +1948,13 @@ async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
             build_blocked_list_text(),
             reply_markup=back_keyboard("admin_back"))
 
+    elif data == "admin_toggle_auto":
+        auto_approve_enabled = not auto_approve_enabled
+        save_settings()
+        status = "включено 🟢" if auto_approve_enabled else "выключено 🔴"
+        await query.answer(f"Автопринятие заявок {status}", show_alert=True)
+        await query.edit_message_text(admin_text(), reply_markup=admin_keyboard())
+
     elif data == "admin_back":
         await query.edit_message_text(admin_text(), reply_markup=admin_keyboard())
 
@@ -1971,7 +1985,6 @@ async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     else:
         await query.answer("Неизвестная команда.", show_alert=True)
 
-# ── ОБРАБОТЧИК СООБЩЕНИЙ БОТА 2 ──────────
 async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
         return
@@ -1979,7 +1992,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
     uid = update.effective_user.id
     record_active_user_id(uid)
 
-    # --- тест модерации (админ) ---
     if context.user_data.get("awaiting_test_media") and uid == ADMIN_ID:
         msg = update.message
         if msg.text and not msg.photo and not msg.video and not msg.animation and not msg.sticker:
@@ -2020,7 +2032,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
                 parse_mode="Markdown", reply_markup=admin_keyboard())
         return
 
-    # --- ник для топа ---
     if context.user_data.get("awaiting_top_nick"):
         nick = (update.message.text or "").strip()
         if not nick or len(nick) > 32:
@@ -2037,7 +2048,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
             reply_markup=top_keyboard(uid))
         return
 
-    # --- добавление ID (админ) ---
     if context.user_data.get("awaiting_ids") and uid == ADMIN_ID:
         text = (update.message.text or "").strip()
         new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
@@ -2057,7 +2067,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
         context.user_data.pop("awaiting_ids", None)
         return
 
-    # --- рассылка (админ) ---
     if context.user_data.get("awaiting_broadcast") and uid == ADMIN_ID:
         txt = update.message.text
         if not txt:
@@ -2080,7 +2089,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
         await update.message.reply_text(f"✅ Готово!\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}")
         return
 
-    # --- блокировка (админ) ---
     if context.user_data.get("awaiting_block_add") and uid == ADMIN_ID:
         raw = (update.message.text or "").strip()
         parts = raw.split(maxsplit=1)
@@ -2115,7 +2123,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=admin_keyboard())
         return
 
-    # --- блок обычных пользователей ---
     if is_user_blocked(uid) and uid != ADMIN_ID:
         return
 
@@ -2127,7 +2134,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
     else:
         await main_menu(update, context)
 
-# ── АНОНИМКА БОТА 2 ───────────────────────
 async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     msg = update.message
@@ -2149,7 +2155,6 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
              "документ"  if msg.document  else
              "стикер"    if msg.sticker   else "текст")
 
-    # ── Модерация ──
     if msg.photo:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ok, reason = await is_image_acceptable(context.bot, msg.photo[-1].file_id)
@@ -2186,7 +2191,6 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
             await msg.reply_text(f"🚫 *Сообщение не принято*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
-    # ── Отправка в канал ──
     mid = await send_to_channel(context, update, text)
     if mid is None:
         await msg.reply_text("❌ Не удалось отправить. Попробуй позже.")
@@ -2227,7 +2231,6 @@ def _log_blocked(uid, update, ctype, text, reason, now):
         "blocked": reason,
     })
 
-# ── ИИ-ЧАТ БОТА 2 (отключен) ────────────────────────
 async def handle_ai_chat(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     inp = update.message.text
     if not inp:
@@ -2236,11 +2239,12 @@ async def handle_ai_chat(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     await update.message.reply_text("⚠️ ИИ временно недоступен.")
 
-# ── Автопринятие заявок в закрытый канал (Bot2) ──
 async def bot2_auto_approve_join(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
-    """Автоматически одобряет все заявки на вступление в канал."""
     req = update.chat_join_request
     if not req:
+        return
+    if not auto_approve_enabled:
+        logger.info(f"[Bot2] ⏸ Автопринятие выключено, заявка {req.from_user.id} → {req.chat.id} проигнорирована")
         return
     try:
         await req.approve()
@@ -2249,7 +2253,6 @@ async def bot2_auto_approve_join(update: Update, context: PTBContextTypes.DEFAUL
     except Exception as e:
         logger.error(f"[Bot2] ❌ Ошибка автопринятия заявки {req.from_user.id}: {e}")
 
-# ── КНОПКИ БОТА 2 ────────────────────────
 async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2345,7 +2348,6 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
     else:
         await query.answer("Неизвестная команда. Используй /start.", show_alert=True)
 
-# ── ЛОГИ / ПАГИНАЦИЯ ─────────────────────
 def _paginate(items, page, per=5):
     total = max(1, (len(items) + per - 1) // per)
     page = max(0, min(page, total - 1))
@@ -2483,7 +2485,7 @@ async def clean_old_logs(query):
         reply_markup=admin_keyboard())
 
 # ═══════════════════════════════════════════════════════════════════
-# ЗАПУСК ОБОИХ БОТОВ
+# ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════
 
 async def run_bot1():
@@ -2513,7 +2515,7 @@ def run_bot2():
             PTBfilters.ALL & ~PTBfilters.COMMAND & ~PTBfilters.ChatType.CHANNEL,
             bot2_handle_message
         ))
-        logger.info("[Bot2] Анонимные сообщения + админка + автопринятие заявок запущены!")
+        logger.info("[Bot2] Запущен (модерация: nudity + offensive + gore, автопринятие заявок)")
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, stop_signals=None)
     finally:
         loop.close()
