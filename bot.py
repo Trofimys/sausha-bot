@@ -17,7 +17,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── aiogram (бот 1: анонимные комментарии) ──
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, ChatJoinRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,6 +33,7 @@ from telegram.ext import (
     ContextTypes as PTBContextTypes,
     filters as PTBfilters,
     CallbackQueryHandler as PTBCallbackQueryHandler,
+    ChatJoinRequestHandler as PTBChatJoinRequestHandler,
 )
 
 if sys.platform == "win32":
@@ -66,8 +67,8 @@ BOT1_DISCUSSION_CHAT_ID = int(os.environ.get("BOT1_DISCUSSION_CHAT_ID", "-100371
 
 BOT2_TOKEN            = os.environ.get("BOT2_TOKEN", "")
 BOT2_CHANNEL_ID       = int(os.environ.get("BOT2_CHANNEL_ID", "-1003854171715"))
-BOT2_USERNAME         = os.environ.get("BOT2_USERNAME", "podslushka67972_bot")  # изменено
-BOT2_CHAT_INVITE      = os.environ.get("BOT2_CHAT_INVITE", "https://t.me/+D8BJn_6hc41lOGMx")  # изменено
+BOT2_USERNAME         = os.environ.get("BOT2_USERNAME", "podslushka67972_bot")
+BOT2_CHAT_INVITE      = os.environ.get("BOT2_CHAT_INVITE", "https://t.me/+D8BJn_6hc41lOGMx")
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8627543263"))
 
 # ── Модерация логов: делаем опциональной ──
@@ -460,6 +461,19 @@ async def bot1_on_discussion_forward(message: Message):
     channel_post_id = message.forward_from_message_id
     bot1_post_to_discussion_id[channel_post_id] = message.message_id
     logger.info(f"[Bot1] Форвард поста {channel_post_id} -> discussion {message.message_id}")
+
+# ── Автопринятие заявок в закрытый канал (Bot1) ──
+@bot1_dp.chat_join_request()
+async def bot1_auto_approve_join(request: ChatJoinRequest):
+    """Автоматически одобряет все заявки на вступление в канал."""
+    user_id = request.from_user.id
+    chat_id = request.chat.id
+    try:
+        await request.approve()
+        logger.info(f"[Bot1] ✅ Автопринятие заявки: {user_id} → {chat_id}")
+        record_active_user_id(user_id)
+    except Exception as e:
+        logger.error(f"[Bot1] ❌ Ошибка автопринятия заявки {user_id}: {e}")
 
 # ── Автоудаление спама от сторонних ботов (A_ToolsX и подобных) ──
 SPAM_KEYWORDS = ["A_ToolsX", "t.me/A_ToolsX", "To use this bot, you must join"]
@@ -2222,6 +2236,19 @@ async def handle_ai_chat(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     await update.message.reply_text("⚠️ ИИ временно недоступен.")
 
+# ── Автопринятие заявок в закрытый канал (Bot2) ──
+async def bot2_auto_approve_join(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
+    """Автоматически одобряет все заявки на вступление в канал."""
+    req = update.chat_join_request
+    if not req:
+        return
+    try:
+        await req.approve()
+        logger.info(f"[Bot2] ✅ Автопринятие заявки: {req.from_user.id} → {req.chat.id}")
+        record_active_user_id(req.from_user.id)
+    except Exception as e:
+        logger.error(f"[Bot2] ❌ Ошибка автопринятия заявки {req.from_user.id}: {e}")
+
 # ── КНОПКИ БОТА 2 ────────────────────────
 async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2229,7 +2256,6 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
     data = query.data
     uid = update.effective_user.id
 
-    # Делегируем всё admin_callback, если это adminские данные
     if (data.startswith("admin_") or data.startswith("msg_page_")
             or data.startswith("start_page_") or data.startswith("anon_msg_page_")
             or data in ("msg_clear", "start_clear", "anon_msg_clear")):
@@ -2482,11 +2508,12 @@ def run_bot2():
         app.add_handler(PTBCommandHandler("admin", bot2_cmd_admin))
         app.add_handler(PTBCommandHandler("cancel", bot2_cmd_cancel))
         app.add_handler(PTBCallbackQueryHandler(bot2_button_callback))
+        app.add_handler(PTBChatJoinRequestHandler(bot2_auto_approve_join))
         app.add_handler(PTBMessageHandler(
             PTBfilters.ALL & ~PTBfilters.COMMAND & ~PTBfilters.ChatType.CHANNEL,
             bot2_handle_message
         ))
-        logger.info("[Bot2] Анонимные сообщения + админка запущены!")
+        logger.info("[Bot2] Анонимные сообщения + админка + автопринятие заявок запущены!")
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, stop_signals=None)
     finally:
         loop.close()
