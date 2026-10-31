@@ -616,11 +616,6 @@ async def bot1_cmd_start(message: Message, state: FSMContext):
             await message.answer("👋 Привет! Нажми кнопку «• • •» под постом в канале, чтобы оставить анонимный комментарий.")
             return
 
-        bot_username = await bot1_get_username()
-        if not await bot1_check_subscription(message.from_user.id):
-            await bot1_send_sub_required(message, bot_username, param)
-            return
-
         bot1_pending[message.from_user.id] = (post_id, reply_to_msg_id)
         await state.set_state(AnonState.waiting_text)
         await message.answer(
@@ -639,29 +634,6 @@ async def bot1_cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     bot1_pending.pop(message.from_user.id, None)
     await message.answer("❌ Отправка отменена.")
-
-async def bot1_check_subscription(user_id: int) -> bool:
-    try:
-        member = await bot1.get_chat_member(chat_id=BOT1_DISCUSSION_CHAT_ID, user_id=user_id)
-        return member.status not in ("left", "kicked", "banned")
-    except Exception as e:
-        logger.warning(f"[Bot1] Не удалось проверить подписку для {user_id}: {e}")
-        return True
-
-async def bot1_send_sub_required(message: Message, bot_username: str, param: str):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Подписаться на чат", url=BOT2_CHAT_INVITE)],
-        [InlineKeyboardButton(
-            text="✅ Я подписался — проверить",
-            url=f"https://t.me/{bot_username}?start={param}"
-        )],
-    ])
-    await message.answer(
-        "❗ Чтобы оставить анонимный комментарий, нужно быть участником нашего чата.\n\n"
-        "1️⃣ Подпишись на чат по кнопке ниже\n"
-        "2️⃣ Нажми «✅ Я подписался — проверить»",
-        reply_markup=kb
-    )
 
 async def bot1_notify_admin(message: Message, post_id: int, content_type: str, caption_text: str, pseudo: str):
     u = message.from_user
@@ -705,16 +677,6 @@ async def send_anon_comment(
     if not data:
         await state.clear()
         await message.answer("❌ Ошибка. Нажми кнопку под постом снова.")
-        return
-
-    if not await bot1_check_subscription(user_id):
-        post_id_tmp, _ = data
-        bot_username = await bot1_get_username()
-        discussion_msg_id = bot1_post_to_discussion_id.get(post_id_tmp)
-        param = f"reply_{discussion_msg_id}" if discussion_msg_id else f"post_{post_id_tmp}"
-        await state.clear()
-        bot1_pending.pop(user_id, None)
-        await bot1_send_sub_required(message, bot_username, param)
         return
 
     post_id, reply_to_msg_id = data
