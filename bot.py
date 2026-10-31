@@ -10,8 +10,6 @@ import csv
 import io
 import tempfile
 import threading
-import time
-import urllib.request
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -147,6 +145,7 @@ def bot1_get_pseudo(user_id: int, post_id: int) -> str:
         rng = random.Random(f"{user_id}:{post_id}:{os.urandom(4).hex()}")
         chosen = rng.sample(EMOJI_POOL, PSEUDO_LEN)
         bot1_user_pseudos[user_id][post_id] = "".join(chosen)
+    _save_bot_state()
     return bot1_user_pseudos[user_id][post_id]
 
 def bot1_admin_keyboard() -> InlineKeyboardMarkup:
@@ -456,13 +455,15 @@ async def bot1_admin_block_remove_input(message: Message):
 @bot1_dp.message(
     lambda m: (
         m.chat.id == BOT1_DISCUSSION_CHAT_ID
-        and m.forward_from_chat is not None
-        and m.forward_from_chat.id == BOT1_CHANNEL_ID
+        and (m.is_automatic_forward or (
+            m.forward_from_chat is not None
+            and m.forward_from_chat.id == BOT1_CHANNEL_ID))
     )
 )
 async def bot1_on_discussion_forward(message: Message):
     channel_post_id = message.forward_from_message_id
     bot1_post_to_discussion_id[channel_post_id] = message.message_id
+    _save_bot_state()
     logger.info(f"[Bot1] Форвард поста {channel_post_id} -> discussion {message.message_id}")
 
 # ── Автопринятие заявок в закрытый канал (Bot1) ──
@@ -569,6 +570,7 @@ async def bot1_on_discussion_reply(message: Message):
     replier_name = message.from_user.full_name
 
     bot1_reply_msg_to_post[message.message_id] = post_id
+    _save_bot_state()
 
     username = await bot1_get_username()
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -739,6 +741,19 @@ async def send_anon_comment(
                 reply_to_message_id=sent_media.message_id
             )
 
+        elif content_type == "video_note":
+            sent_media = await bot1.send_video_note(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                video_note=file_id,
+                reply_to_message_id=reply_to_msg_id
+            )
+            sent = await bot1.send_message(
+                chat_id=BOT1_DISCUSSION_CHAT_ID,
+                text=full_caption,
+                parse_mode="HTML",
+                reply_to_message_id=sent_media.message_id
+            )
+
         else:
             await message.answer("⚠️ Неподдерживаемый тип сообщения.")
             return
@@ -749,6 +764,7 @@ async def send_anon_comment(
         if sent:
             bot1_anon_msg_to_user[sent.message_id] = user_id
             bot1_anon_msg_to_post[sent.message_id] = post_id
+        _save_bot_state()
 
         await state.clear()
         bot1_pending.pop(user_id, None)
@@ -810,6 +826,19 @@ async def handle_sticker(message: Message, state: FSMContext):
     await send_anon_comment(message, state, "sticker",
                             file_id=message.sticker.file_id)
 
+@bot1_dp.message(AnonState.waiting_text, F.video_note)
+async def handle_video_note(message: Message, state: FSMContext):
+    await send_anon_comment(message, state, "video_note",
+                            file_id=message.video_note.file_id)
+
+@bot1_dp.message(AnonState.waiting_text)
+async def handle_other_types(message: Message, state: FSMContext):
+    await message.answer(
+        "⚠️ Такой тип сообщения не поддерживается.\n"
+        "Отправь текст, фото, видео, GIF, стикер, аудио или файл.\n\n"
+        "/cancel — отмена"
+    )
+
 
 # ═══════════════════════════════════════════════════════════════════
 # БОТ 2: АНОНИМНЫЕ СООБЩЕНИЯ В КАНАЛ + АДМИНКА
@@ -842,22 +871,6 @@ async def _keep_alive():
             pass
         await asyncio.sleep(540)
 
-SYSTEM_PROMPT = """
-Ты — живой, интересный собеседник с лёгким характером. Твоя цель — приятное и естественное общение.
-Ты не используешь шаблонные фразы и не повторяешь заученные ответы.
-Каждый твой ответ уникален и зависит от контекста диалога.
-Будь дружелюбным, иногда с ноткой иронии, но без мата и грубости.
-""".strip()
-
-CONTENT_CHECK_PROMPT = """
-Ты — модератор. Оцени текст сообщения:
-1) Осмысленность: сообщение должно выражать связную мысль, а не быть случайным набором символов.
-2) Не спам: нет ссылок, рекламы, призывов перейти куда-либо.
-3) Не содержит явной порнографии или очень грубого контента (мат в умеренном количестве допустим).
-Модерация НЕ строгая — блокируй только явно неприемлемое.
-Отвечай ТОЛЬКО JSON: {"acceptable": true/false, "reason": "причина если false"}.
-""".strip()
-
 LOG_FILE           = "anon_logs.json"
 START_LOG_FILE     = "start_logs.json"
 MANUAL_IDS_FILE    = "manual_ids.json"
@@ -865,14 +878,12 @@ TOP_FILE           = "top_data.json"
 ANON_MSGS_LOG_FILE = "anon_messages_log.json"
 BLOCKED_FILE       = "blocked_users.json"
 SETTINGS_FILE      = "settings.json"
+BOT_STATE_FILE     = "bot_state.json"
 
 COOLDOWN_SECONDS = 180
-ANONYMOUS_MODE, AI_CHAT_MODE = 1, 2
-TYPING_DELAY = 0.015
-UPDATE_INTERVAL = 5
+ANONYMOUS_MODE = 1
 
 user_last_time: dict[int, datetime] = {}
-user_ai_context: dict[int, list[dict]] = {}
 message_logs: list[dict] = []
 start_logs: list[dict] = []
 manual_ids: list[int] = []
@@ -900,32 +911,39 @@ _MDV2 = re.compile(r'([_*\[\]()~`>#+=|{}.!\\-])')
 def escape_mdv2(t: str) -> str:
     return _MDV2.sub(r"\\\1", t)
 
+# Бот 1 и бот 2 живут в разных потоках и пишут в одни файлы — все операции
+# ввода-вывода сериализуем. RLock, потому что save_* вызываются из-под lock.
+_io_lock = threading.RLock()
+
 def _load_json(path) -> list:
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    with _io_lock:
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
 
 def _load_json_dict(path) -> dict:
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with _io_lock:
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
 def _save_json(path, data):
-    try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.error("Ошибка записи %s: %s", path, e)
+    with _io_lock:
+        try:
+            tmp = f"{path}.{random.randint(1000, 999999)}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.error("Ошибка записи %s: %s", path, e)
 
 def current_week_key() -> str:
     today = datetime.now()
@@ -966,10 +984,11 @@ def save_manual_ids(ids: list[int]):
 
 def record_active_user_id(uid: int):
     global manual_ids
-    if isinstance(uid, int) and uid > 0 and uid not in manual_ids:
-        manual_ids.append(uid)
-        manual_ids = sorted(list(set(manual_ids)))
-        save_manual_ids(manual_ids)
+    with _io_lock:
+        if isinstance(uid, int) and uid > 0 and uid not in manual_ids:
+            manual_ids.append(uid)
+            manual_ids = sorted(list(set(manual_ids)))
+            save_manual_ids(manual_ids)
 
 @bot1_dp.message.outer_middleware()
 async def bot1_user_capture_middleware(handler, event: Message, data: dict):
@@ -1115,6 +1134,52 @@ def load_all_logs():
     load_settings()
 
 load_all_logs()
+
+# ── Персистентность карт бота 1 (связи пост↔чат, комментарии, псевдонимы) ──
+# Без этого после рестарта ссылки «Ответить • • •» давали «Сообщение устарело».
+
+def _save_bot_state():
+    with _io_lock:
+        _save_json(BOT_STATE_FILE, {
+            "post_to_discussion": {str(k): v for k, v in bot1_post_to_discussion_id.items()},
+            "anon_msg_to_user":   {str(k): v for k, v in bot1_anon_msg_to_user.items()},
+            "anon_msg_to_post":   {str(k): v for k, v in bot1_anon_msg_to_post.items()},
+            "reply_msg_to_post":  {str(k): v for k, v in bot1_reply_msg_to_post.items()},
+            "user_pseudos": {
+                str(u): {str(p): n for p, n in posts.items()}
+                for u, posts in bot1_user_pseudos.items()
+            },
+        })
+
+def _load_bot_state():
+    data = _load_json_dict(BOT_STATE_FILE)
+    if not data:
+        return
+    def _int_map(d):
+        out = {}
+        for k, v in (d or {}).items():
+            try:
+                out[int(k)] = int(v)
+            except (TypeError, ValueError):
+                pass
+        return out
+    bot1_post_to_discussion_id.update(_int_map(data.get("post_to_discussion")))
+    bot1_anon_msg_to_user.update(_int_map(data.get("anon_msg_to_user")))
+    bot1_anon_msg_to_post.update(_int_map(data.get("anon_msg_to_post")))
+    bot1_reply_msg_to_post.update(_int_map(data.get("reply_msg_to_post")))
+    for u, posts in (data.get("user_pseudos") or {}).items():
+        try:
+            uid = int(u)
+        except (TypeError, ValueError):
+            continue
+        inner = bot1_user_pseudos.setdefault(uid, {})
+        for p, n in (posts or {}).items():
+            try:
+                inner[int(p)] = str(n)
+            except (TypeError, ValueError):
+                pass
+
+_load_bot_state()
 
 def add_message_log(entry):
     message_logs.append(entry)
@@ -1380,7 +1445,9 @@ async def is_sticker_acceptable(bot, sticker) -> tuple[bool, str]:
         tg_file = await bot.get_file(sticker.file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
         if sticker.is_animated:
-            jpg = await _convert_to_jpg_bytes(file_bytes, ".tgs")
+            # .tgs — это Lottie-анимация (JSON), ffmpeg её в картинку не конвертирует.
+            # Проверить невозможно — отклоняем, а не пропускаем.
+            return False, "анимированные стикеры не проходят проверку"
         elif sticker.is_video:
             jpg = await _convert_to_jpg_bytes(file_bytes, ".webm")
         else:
@@ -1491,21 +1558,6 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
         return False, "слишком короткое"
     return True, ""
 
-async def typewriter_reply(update: Update, full_text: str):
-    if not full_text:
-        return
-    msg = await update.message.reply_text("▌")
-    displayed = ""
-    for i, ch in enumerate(full_text, 1):
-        displayed += ch
-        if i % UPDATE_INTERVAL == 0 or i == len(full_text):
-            cursor = "" if i == len(full_text) else "▌"
-            try:
-                await msg.edit_text(displayed + cursor)
-            except Exception:
-                pass
-        await asyncio.sleep(TYPING_DELAY)
-
 async def send_to_channel(context, update, text) -> int | None:
     msg = update.message
     bot = context.bot
@@ -1544,6 +1596,10 @@ async def send_to_channel(context, update, text) -> int | None:
                                         caption=full, parse_mode="MarkdownV2")
         elif msg.sticker:
             s = await bot.send_sticker(BOT2_CHANNEL_ID, msg.sticker.file_id)
+            await bot.send_message(BOT2_CHANNEL_ID, f"{header}\n\n{footer}",
+                                   parse_mode="MarkdownV2", disable_web_page_preview=True)
+        elif msg.video_note:
+            s = await bot.send_video_note(BOT2_CHANNEL_ID, msg.video_note.file_id)
             await bot.send_message(BOT2_CHANNEL_ID, f"{header}\n\n{footer}",
                                    parse_mode="MarkdownV2", disable_web_page_preview=True)
         elif msg.text:
@@ -1675,12 +1731,6 @@ def top_keyboard(uid):
         PTBInlineKeyboardButton("🔙  Назад",    callback_data="menu_back"),
     ])
     return PTBInlineKeyboardMarkup(rows)
-
-def ai_keyboard():
-    return PTBInlineKeyboardMarkup([
-        [PTBInlineKeyboardButton("🧠  Сбросить память", callback_data="ai_reset"),
-         PTBInlineKeyboardButton("🔙  Назад",           callback_data="menu_back")],
-    ])
 
 def after_anon_keyboard():
     return PTBInlineKeyboardMarkup([
@@ -2091,8 +2141,6 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
     state = context.user_data.get("state")
     if state == ANONYMOUS_MODE:
         await handle_anonymous(update, context)
-    elif state == AI_CHAT_MODE:
-        await handle_ai_chat(update, context)
     else:
         await main_menu(update, context)
 
@@ -2109,12 +2157,18 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
         await msg.reply_text(f"⏳ Подожди ещё {m}:{s:02d} перед следующей отправкой.")
         return
 
+    if not (msg.photo or msg.sticker or msg.video or msg.animation
+            or msg.video_note or msg.voice or msg.audio or msg.document or msg.text):
+        await msg.reply_text("⚠️ Такой тип сообщения не поддерживается (контакты, локации и т.п.).")
+        return
+
     ctype = ("фото"      if msg.photo     else
              "видео"     if msg.video     else
              "GIF"       if msg.animation else
              "аудио"     if msg.audio     else
              "голосовое" if msg.voice     else
              "документ"  if msg.document  else
+             "кружок"    if msg.video_note else
              "стикер"    if msg.sticker   else "текст")
 
     if msg.photo:
@@ -2143,6 +2197,15 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
             _log_blocked(uid, update, ctype, text, reason, now)
             await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
             await msg.reply_text(f"🚫 *Видео не принято*\n\nПричина: {reason}", parse_mode="Markdown")
+            return
+
+    elif msg.video_note:
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        ok, reason = await is_video_acceptable(context.bot, msg.video_note.file_id)
+        if not ok:
+            _log_blocked(uid, update, ctype, text, reason, now)
+            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await msg.reply_text(f"🚫 *Кружок не принят*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
     elif msg.text:
@@ -2192,14 +2255,6 @@ def _log_blocked(uid, update, ctype, text, reason, now):
         "timestamp": now.isoformat(),
         "blocked": reason,
     })
-
-async def handle_ai_chat(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
-    inp = update.message.text
-    if not inp:
-        await update.message.reply_text("В режиме ИИ принимается только текст.")
-        return
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    await update.message.reply_text("⚠️ ИИ временно недоступен.")
 
 async def bot2_auto_approve_join(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     req = update.chat_join_request
@@ -2270,15 +2325,6 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
             "👋 Ты вышел из топа.\n\nВозвращайся в любой момент!",
             reply_markup=top_keyboard(uid))
 
-    elif data == "menu_ai":
-        context.user_data["state"] = AI_CHAT_MODE
-        await query.edit_message_text(
-            "🤖 *ИИ-чат активен*\n\n"
-            "Просто напиши что-нибудь и я отвечу 💬\n\n"
-            "Я запоминаю последние 3 сообщения диалога.",
-            parse_mode="Markdown",
-            reply_markup=ai_keyboard())
-
     elif data == "menu_help":
         await query.edit_message_text(
             "❓ *Помощь*\n\n"
@@ -2287,8 +2333,6 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
             "Поддерживаются: текст, фото, видео, голос, GIF, стикер.\n\n"
             "🏆 *Топ анонимщиков*\n"
             "Еженедельный рейтинг. Каждая анонимка = +1 к счёту.\n\n"
-            "🤖 *ИИ-чат*\n"
-            "Общайся с искусственным интеллектом на любую тему.\n\n"
             "/start — вернуться в главное меню",
             parse_mode="Markdown",
             reply_markup=back_keyboard("menu_back"))
@@ -2296,12 +2340,6 @@ async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_
     elif data == "menu_back":
         context.user_data.pop("state", None)
         await main_menu(update, context, edit=True)
-
-    elif data == "ai_reset":
-        user_ai_context.pop(uid, None)
-        await query.edit_message_text(
-            "🧠 Память сброшена. Начинаем с чистого листа!",
-            reply_markup=ai_keyboard())
 
     elif data == "anon_again":
         context.user_data["state"] = ANONYMOUS_MODE
