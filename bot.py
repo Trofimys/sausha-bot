@@ -176,6 +176,8 @@ def bot1_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📣  Рассылка",      callback_data="b1_admin_broadcast")],
         [InlineKeyboardButton(text="📋  Список ID",     callback_data="b1_admin_list_ids")],
         [InlineKeyboardButton(text=auto_text,            callback_data="b1_admin_toggle_auto")],
+        [InlineKeyboardButton(text=f"👑  Царь-батюшка: {'ВКЛ' if tsar_enabled else 'ВЫКЛ'}",
+                              callback_data="b1_admin_tsar")],
         [InlineKeyboardButton(text="📤  Экспорт CSV",   callback_data="b1_admin_export"),
          InlineKeyboardButton(text="🧹  Удалить >7д",   callback_data="b1_admin_clean_old")],
         [InlineKeyboardButton(text="🚫  Заблокировать", callback_data="b1_admin_block_add"),
@@ -277,7 +279,7 @@ async def bot1_show_anon_messages_page(callback, page):
 
 @bot1_dp.callback_query(F.data.startswith("b1_admin"))
 async def bot1_admin_callback(callback):
-    global message_logs, auto_approve_enabled
+    global message_logs, auto_approve_enabled, tsar_enabled, tsar_rigged
     uid = callback.from_user.id
     data = callback.data
     if uid not in admin_authorized:
@@ -384,6 +386,32 @@ async def bot1_admin_callback(callback):
         status = "включено 🟢" if auto_approve_enabled else "выключено 🔴"
         await callback.answer(f"Автопринятие заявок {status}", show_alert=True)
         await callback.message.edit_text(admin_text(), reply_markup=bot1_admin_keyboard())
+    elif data == "b1_admin_tsar":
+        await callback.message.edit_text(tsar_admin_text(), parse_mode="HTML",
+                                         reply_markup=bot1_tsar_keyboard())
+    elif data == "b1_admin_tsar_toggle":
+        tsar_enabled = not tsar_enabled
+        save_settings()
+        status = "включён 🟢" if tsar_enabled else "выключен 🔴"
+        await callback.answer(f"Царь-батюшка {status}", show_alert=True)
+        await callback.message.edit_text(tsar_admin_text(), parse_mode="HTML",
+                                         reply_markup=bot1_tsar_keyboard())
+    elif data == "b1_admin_tsar_rig":
+        bot1_admin_state[uid] = "awaiting_tsar_rig"
+        await callback.message.edit_text(
+            "🎯 Подкрутка царя\n\n"
+            "Отправь @username или числовой ID участника, который всегда должен быть правым.\n"
+            "Можно несколько через пробел.\n\n"
+            f"Сейчас: {_tsar_escape(tsar_rig_display())}\n\n"
+            "/cancel — отмена",
+            parse_mode="HTML",
+            reply_markup=bot1_admin_back_keyboard())
+    elif data == "b1_admin_tsar_rig_clear":
+        tsar_rigged = []
+        save_settings()
+        await callback.answer("Подкрутка сброшена", show_alert=True)
+        await callback.message.edit_text(tsar_admin_text(), parse_mode="HTML",
+                                         reply_markup=bot1_tsar_keyboard())
     elif data == "b1_admin_back":
         bot1_admin_state.pop(uid, None)
         await callback.message.edit_text(admin_text(), reply_markup=bot1_admin_keyboard())
@@ -488,6 +516,23 @@ async def bot1_admin_block_remove_input(message: Message):
     ok = unblock_user(target)
     await message.reply(f"✅ Разблокирован: {target}" if ok else f"ℹ️ {target} не был заблокирован.")
 
+@bot1_dp.message(F.text, lambda m: m.from_user and m.from_user.id in admin_authorized and bot1_admin_state.get(m.from_user.id) == "awaiting_tsar_rig")
+async def bot1_admin_tsar_rig_input(message: Message):
+    global tsar_rigged
+    bot1_admin_state.pop(message.from_user.id, None)
+    parsed = tsar_parse_participants(message.text or "")
+    if not parsed:
+        await message.reply("❌ Не нашёл @username или числовой ID. Попробуй ещё раз.")
+        return
+    added = 0
+    for p in parsed:
+        if p["key"] not in tsar_rigged:
+            tsar_rigged.append(p["key"])
+            added += 1
+    save_settings()
+    tail = f"\nДобавлено: {added}" if added else "\nВсе уже были в списке."
+    await message.reply(f"🎯 Подкрутка: {tsar_rig_display()}{tail}")
+
 @bot1_dp.message(
     lambda m: (
         m.chat.id == BOT1_DISCUSSION_CHAT_ID
@@ -582,6 +627,151 @@ async def bot1_on_channel_post(message: Message):
             logger.info(f"[Bot1] Промпт отправлен без reply: {sent.message_id}")
         except Exception as e2:
             logger.error(f"[Bot1] Совсем не удалось отправить: {e2}")
+
+# ── Царь-батюшка: шуточный судья споров (Bot1, только чат обсуждений) ──
+TSAR_CMD_RE = re.compile(r"^\s*/\s*царь\b", re.IGNORECASE)
+TSAR_PARTICIPANT_RE = re.compile(
+    r"@([A-Za-z][A-Za-z0-9_]{3,31})|(?<!\d)(\d{5,15})(?!\d)")
+
+def _is_tsar_command(message: Message) -> bool:
+    return bool(message.text and TSAR_CMD_RE.match(message.text))
+
+def tsar_parse_participants(text: str) -> list[dict]:
+    """Достаёт участников спора из текста команды: @username и/или числовые ID."""
+    seen: set[str] = set()
+    result: list[dict] = []
+    for m in TSAR_PARTICIPANT_RE.finditer(text or ""):
+        if m.group(1):
+            display = f"@{m.group(1)}"
+            key = f"u:{m.group(1).lower()}"
+        else:
+            display = m.group(2)
+            key = f"i:{m.group(2)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"key": key, "display": display})
+    return result
+
+def tsar_rig_display() -> str:
+    if not tsar_rigged:
+        return "не задана"
+    parts = []
+    for key in tsar_rigged:
+        kind, _, val = key.partition(":")
+        parts.append(f"@{val}" if kind == "u" else val)
+    return ", ".join(parts)
+
+def tsar_pick_right(participants: list[dict]) -> dict:
+    """Правым становится подкрученный участник, иначе случайный."""
+    rigged = [p for p in participants if p["key"] in tsar_rigged]
+    return random.choice(rigged or participants)
+
+def _tsar_escape(t: str) -> str:
+    return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def tsar_verdict_text(participants: list[dict], right: dict) -> str:
+    wrong = [p["display"] for p in participants if p is not right]
+    lines = [
+        "👑 <b>Царь-батюшка решил</b>",
+        "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+        f"✅ Прав: <b>{_tsar_escape(right['display'])}</b>",
+    ]
+    if wrong:
+        lines.append("❌ Не правы: " +
+                     ", ".join(f"<b>{_tsar_escape(x)}</b>" for x in wrong))
+    return "\n".join(lines)
+
+def tsar_admin_text() -> str:
+    status = "🟢 включён" if tsar_enabled else "🔴 выключен"
+    return (
+        "👑 <b>Царь-батюшка</b>\n\n"
+        f"Статус: {status}\n"
+        f"🎯 Подкрутка: {_tsar_escape(tsar_rig_display())}\n\n"
+        "Команда в чате обсуждений:\n"
+        "<code>/царь батюшка реши спор кто не прав -20\n"
+        "@user1 @user2 123456789</code>\n\n"
+        "Подкрученный участник всегда объявляется правым. "
+        "Если подкрученных несколько — царь выбирает случайно среди них. "
+        "Без подкрутки — случайный участник."
+    )
+
+def bot1_tsar_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        text=f"🔁 {'Выключить' if tsar_enabled else 'Включить'} функцию",
+        callback_data="b1_admin_tsar_toggle")],
+        [InlineKeyboardButton(text="🎯 Задать подкрутку",
+                              callback_data="b1_admin_tsar_rig")]]
+    if tsar_rigged:
+        rows.append([InlineKeyboardButton(text="❌ Сбросить подкрутку",
+                                          callback_data="b1_admin_tsar_rig_clear")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад в панель",
+                                      callback_data="b1_admin_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@bot1_dp.message(
+    lambda m: (
+        m.chat.id == BOT1_DISCUSSION_CHAT_ID
+        and tsar_enabled
+        and _is_tsar_command(m)
+    )
+)
+async def bot1_tsar_judge(message: Message):
+    participants = tsar_parse_participants(message.text or "")
+    chat_id = message.chat.id
+
+    if not participants:
+        try:
+            hint = await message.reply(
+                "👑 Укажи участников спора: @username или числовой ID.")
+            await asyncio.sleep(10)
+            await hint.delete()
+        except Exception:
+            pass
+        return
+
+    now = datetime.now()
+    last = tsar_last_used.get(chat_id)
+    if last:
+        remaining = TSAR_COOLDOWN_SECONDS - (now - last).total_seconds()
+        if remaining > 0:
+            mins, secs = divmod(int(remaining) + 1, 60)
+            wait_text = f"{mins} мин {secs} сек" if mins else f"{secs} сек"
+            try:
+                warn = await message.reply(
+                    "⏳ Царь-батюшка отдыхает. "
+                    f"Следующий спор можно решить через {wait_text}.")
+                await asyncio.sleep(8)
+                await warn.delete()
+            except Exception:
+                pass
+            return
+
+    tsar_last_used[chat_id] = now
+
+    status = None
+    try:
+        status = await message.reply("📖 Читаю сообщения...")
+        await asyncio.sleep(3)
+        await status.delete()
+        status = await message.reply("🤔 Думаю...")
+        await asyncio.sleep(2)
+        await status.delete()
+        status = None
+    except Exception:
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+
+    right = tsar_pick_right(participants)
+    try:
+        await message.reply(tsar_verdict_text(participants, right),
+                            parse_mode="HTML")
+        logger.info("[Bot1] Царь-батюшка: чат %s, прав %s", chat_id, right["display"])
+    except Exception as e:
+        logger.warning("[Bot1] Не удалось отправить вердикт царя: %s", e)
 
 @bot1_dp.message(
     lambda m: (
@@ -936,6 +1126,11 @@ blocked_users: dict = {}
 blocked_pending: dict = {}
 # Глобальный флаг: включено ли автопринятие заявок в закрытый канал
 auto_approve_enabled: bool = True
+# «Царь-батюшка»: шуточный судья споров в чате обсуждений
+tsar_enabled: bool = True
+tsar_rigged: list[str] = []          # ключи "u:username" / "i:123456"
+tsar_last_used: dict[int, datetime] = {}  # chat_id -> время последнего вердикта
+TSAR_COOLDOWN_SECONDS = 180
 
 def se_increment(n: int = 1):
     key = datetime.now().strftime("%Y-%m")
@@ -1156,13 +1351,21 @@ async def parse_channel_and_chat_ids(bot_instance) -> dict:
     }
 
 def load_settings():
-    global auto_approve_enabled
+    global auto_approve_enabled, tsar_enabled, tsar_rigged
     data = _load_json_dict(SETTINGS_FILE)
     if "auto_approve" in data:
         auto_approve_enabled = bool(data["auto_approve"])
+    if "tsar_enabled" in data:
+        tsar_enabled = bool(data["tsar_enabled"])
+    if isinstance(data.get("tsar_rigged"), list):
+        tsar_rigged = [str(x) for x in data["tsar_rigged"] if str(x).startswith(("u:", "i:"))]
 
 def save_settings():
-    _save_json(SETTINGS_FILE, {"auto_approve": auto_approve_enabled})
+    _save_json(SETTINGS_FILE, {
+        "auto_approve": auto_approve_enabled,
+        "tsar_enabled": tsar_enabled,
+        "tsar_rigged": list(tsar_rigged),
+    })
 
 def load_all_logs():
     global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log, blocked_users, blocked_pending
