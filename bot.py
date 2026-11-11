@@ -4,6 +4,8 @@ import logging
 import random
 import re
 import json
+import hmac
+import secrets
 import httpx
 import sys
 import csv
@@ -67,6 +69,24 @@ BOT2_CHANNEL_ID       = int(os.environ.get("BOT2_CHANNEL_ID", "-1003854171715"))
 BOT2_USERNAME         = os.environ.get("BOT2_USERNAME", "podslushka67972_bot")
 BOT2_CHAT_INVITE      = os.environ.get("BOT2_CHAT_INVITE", "https://t.me/+D8BJn_6hc41lOGMx")
 ADMIN_ID              = int(os.environ.get("ADMIN_ID", "8627543263"))
+# Секретный пароль для /admin. На Render задаётся переменной ADMIN_SECRET.
+# Значение по умолчанию нужно, чтобы панель работала сразу после деплоя.
+ADMIN_SECRET          = os.environ.get("ADMIN_SECRET", "подкушано67").strip()
+
+def admin_secret_ok(raw: str | None) -> bool:
+    if not ADMIN_SECRET:
+        return False
+    # compare_digest для строк работает только с ASCII, поэтому сравниваем байты
+    return hmac.compare_digest((raw or "").strip().encode("utf-8"), ADMIN_SECRET.encode("utf-8"))
+
+# Кто ввёл /admin <пароль> — тот получает доступ к панели до перезапуска бота.
+admin_authorized: set[int] = set()
+
+def admin_recipients() -> list[int]:
+    """Кому присылать уведомления: владелец + все, кто ввёл пароль."""
+    ids = set(admin_authorized)
+    ids.add(ADMIN_ID)
+    return sorted(ids)
 
 _mod_log_raw = os.environ.get("MODERATION_LOG_CHANNEL_ID")
 MODERATION_LOG_CHANNEL_ID = int(_mod_log_raw) if _mod_log_raw else None
@@ -176,10 +196,26 @@ def bot1_list_ids_keyboard() -> InlineKeyboardMarkup:
 
 @bot1_dp.message(Command("admin"))
 async def bot1_cmd_admin(message: Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        await message.reply("⛔️ Доступ запрещён.")
+    parts = (message.text or "").split(maxsplit=1)
+    secret = parts[1] if len(parts) > 1 else ""
+
+    if not admin_secret_ok(secret):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.answer("⛔️ Неверный пароль.")
         return
-    await message.reply(admin_text(), reply_markup=bot1_admin_keyboard())
+
+    admin_authorized.add(message.from_user.id)
+
+    # Убираем сообщение с паролем из истории чата
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await message.answer(admin_text(), reply_markup=bot1_admin_keyboard())
 
 def bot1_nav_keyboard(page, total, prefix, clear_cb) -> InlineKeyboardMarkup:
     nav = []
@@ -244,7 +280,7 @@ async def bot1_admin_callback(callback):
     global message_logs, auto_approve_enabled
     uid = callback.from_user.id
     data = callback.data
-    if uid != ADMIN_ID:
+    if uid not in admin_authorized:
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
 
@@ -356,7 +392,7 @@ async def bot1_admin_callback(callback):
 @bot1_dp.callback_query(F.data.startswith(("b1_msg_", "b1_start_", "b1_anon_")))
 async def bot1_logs_pagination_callback(callback):
     global message_logs, start_logs, anon_messages_log
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id not in admin_authorized:
         await callback.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
     data = callback.data
@@ -381,7 +417,7 @@ async def bot1_logs_pagination_callback(callback):
         await callback.message.edit_text("🧹 Логи анонимных сообщений очищены.", reply_markup=bot1_admin_keyboard())
     await callback.answer()
 
-@bot1_dp.message(F.text, lambda m: m.from_user.id == ADMIN_ID and bot1_admin_state.get(m.from_user.id) == "awaiting_broadcast")
+@bot1_dp.message(F.text, lambda m: m.from_user and m.from_user.id in admin_authorized and bot1_admin_state.get(m.from_user.id) == "awaiting_broadcast")
 async def bot1_admin_broadcast_input(message: Message):
     bot1_admin_state.pop(message.from_user.id, None)
     txt = message.text
@@ -403,7 +439,7 @@ async def bot1_admin_broadcast_input(message: Message):
             failed += 1
     await message.reply(f"✅ Готово!\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}")
 
-@bot1_dp.message(F.text, lambda m: m.from_user.id == ADMIN_ID and bot1_admin_state.get(m.from_user.id) == "awaiting_ids")
+@bot1_dp.message(F.text, lambda m: m.from_user and m.from_user.id in admin_authorized and bot1_admin_state.get(m.from_user.id) == "awaiting_ids")
 async def bot1_admin_add_ids_input(message: Message):
     bot1_admin_state.pop(message.from_user.id, None)
     raw = re.split(r"[,\s]+", message.text.strip())
@@ -424,7 +460,7 @@ async def bot1_admin_add_ids_input(message: Message):
     else:
         await message.reply("⚠️ Все эти ID уже есть.")
 
-@bot1_dp.message(F.text, lambda m: m.from_user.id == ADMIN_ID and bot1_admin_state.get(m.from_user.id) == "awaiting_block_add")
+@bot1_dp.message(F.text, lambda m: m.from_user and m.from_user.id in admin_authorized and bot1_admin_state.get(m.from_user.id) == "awaiting_block_add")
 async def bot1_admin_block_add_input(message: Message):
     parts = message.text.strip().split(maxsplit=1)
     target = resolve_block_target(parts[0]) if parts else None
@@ -442,7 +478,7 @@ async def bot1_admin_block_add_input(message: Message):
     rtxt = f"\nПричина: {reason}" if reason else ""
     await message.reply(f"🚫 Заблокирован: {target}{rtxt}")
 
-@bot1_dp.message(F.text, lambda m: m.from_user.id == ADMIN_ID and bot1_admin_state.get(m.from_user.id) == "awaiting_block_remove")
+@bot1_dp.message(F.text, lambda m: m.from_user and m.from_user.id in admin_authorized and bot1_admin_state.get(m.from_user.id) == "awaiting_block_remove")
 async def bot1_admin_block_remove_input(message: Message):
     target = resolve_block_target(message.text.strip())
     if target is None:
@@ -630,7 +666,7 @@ async def bot1_cmd_start(message: Message, state: FSMContext):
 
 @bot1_dp.message(Command("cancel"))
 async def bot1_cmd_cancel(message: Message, state: FSMContext):
-    if message.from_user.id == ADMIN_ID and bot1_admin_state.pop(message.from_user.id, None):
+    if message.from_user.id in admin_authorized and bot1_admin_state.pop(message.from_user.id, None):
         await message.answer("✅ Отменено.")
         return
     await state.clear()
@@ -654,10 +690,14 @@ async def bot1_notify_admin(message: Message, post_id: int, content_type: str, c
     if caption_text:
         safe_text = caption_text[:300].replace("<", "&lt;").replace(">", "&gt;")
         lines.append(f"💬 Текст:\n{safe_text}")
-    try:
-        await bot1.send_message(ADMIN_ID, "\n".join(lines), parse_mode="HTML")
-    except Exception as e:
-        logger.warning(f"[Bot1] Не удалось уведомить админа: {e}")
+    safe_name = name.replace("<", "&lt;").replace(">", "&gt;")
+    lines[4] = f"📛 Имя: {safe_name}"
+    text = "\n".join(lines)
+    for rid in admin_recipients():
+        try:
+            await bot1.send_message(rid, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"[Bot1] Не удалось уведомить админа {rid}: {e}")
 
 async def send_anon_comment(
     message: Message,
@@ -877,6 +917,7 @@ MANUAL_IDS_FILE    = "manual_ids.json"
 TOP_FILE           = "top_data.json"
 ANON_MSGS_LOG_FILE = "anon_messages_log.json"
 BLOCKED_FILE       = "blocked_users.json"
+BLOCKED_PENDING_FILE = "blocked_pending.json"
 SETTINGS_FILE      = "settings.json"
 BOT_STATE_FILE     = "bot_state.json"
 
@@ -891,6 +932,8 @@ top_data: dict = {}
 se_checks_month: dict = {}
 anon_messages_log: list[dict] = []
 blocked_users: dict = {}
+# Заблокированные анонимки, ожидающие решения админа: token -> данные сообщения
+blocked_pending: dict = {}
 # Глобальный флаг: включено ли автопринятие заявок в закрытый канал
 auto_approve_enabled: bool = True
 
@@ -1122,7 +1165,7 @@ def save_settings():
     _save_json(SETTINGS_FILE, {"auto_approve": auto_approve_enabled})
 
 def load_all_logs():
-    global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log, blocked_users
+    global message_logs, start_logs, manual_ids, top_data, se_checks_month, anon_messages_log, blocked_users, blocked_pending
     message_logs     = _load_json(LOG_FILE)
     start_logs       = _load_json(START_LOG_FILE)
     manual_ids       = load_manual_ids()
@@ -1131,6 +1174,7 @@ def load_all_logs():
     se_checks_month  = _load_json_dict("se_checks.json")
     anon_messages_log = _load_json(ANON_MSGS_LOG_FILE)
     blocked_users    = _load_json_dict(BLOCKED_FILE)
+    blocked_pending  = _load_json_dict(BLOCKED_PENDING_FILE)
     load_settings()
 
 load_all_logs()
@@ -1558,61 +1602,116 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
         return False, "слишком короткое"
     return True, ""
 
-async def send_to_channel(context, update, text) -> int | None:
-    msg = update.message
-    bot = context.bot
-
+def _anon_header_footer() -> tuple[str, str]:
     bot_link = f"https://t.me/{BOT2_USERNAME}"
-    safe = escape_mdv2(text) if text else ""
     chat_link = BOT2_CHAT_INVITE
-
     header = (
         f"*📩 Анонимное сообщение*\n"
         f">[🔴 Отправить анонимку]({bot_link})"
     )
     footer = f">[вейп барахолка и по совместительству чат шiкунчиков]({chat_link})"
+    return header, footer
 
-    full = f"{header}\n\n{safe}\n\n{footer}" if safe else f"{header}\n\n{footer}"
+
+def _anon_caption(text: str) -> str:
+    header, footer = _anon_header_footer()
+    safe = escape_mdv2(text) if text else ""
+    return f"{header}\n\n{safe}\n\n{footer}" if safe else f"{header}\n\n{footer}"
+
+
+def _file_id_of(msg) -> str | None:
+    if msg.photo:
+        return msg.photo[-1].file_id
+    if msg.video:
+        return msg.video.file_id
+    if msg.animation:
+        return msg.animation.file_id
+    if msg.audio:
+        return msg.audio.file_id
+    if msg.voice:
+        return msg.voice.file_id
+    if msg.document:
+        return msg.document.file_id
+    if msg.sticker:
+        return msg.sticker.file_id
+    if msg.video_note:
+        return msg.video_note.file_id
+    return None
+
+
+def _content_from_message(msg, text: str | None = None) -> dict:
+    ctype = ("фото"      if msg.photo     else
+             "видео"     if msg.video     else
+             "GIF"       if msg.animation else
+             "аудио"     if msg.audio     else
+             "голосовое" if msg.voice     else
+             "документ"  if msg.document  else
+             "кружок"    if msg.video_note else
+             "стикер"    if msg.sticker   else "текст")
+    return {
+        "content_type": ctype,
+        "file_id": _file_id_of(msg),
+        "text": text if text is not None else (msg.text or msg.caption or ""),
+    }
+
+
+async def send_anon_to_channel(context, content: dict) -> int | None:
+    """Публикует анонимку в канал по сохранённым данным (тип + file_id + текст)."""
+    bot = context.bot
+    ctype = content.get("content_type")
+    file_id = content.get("file_id")
+    full = _anon_caption(content.get("text") or "")
+    header, footer = _anon_header_footer()
+    header_footer = f"{header}\n\n{footer}"
 
     try:
         s = None
-        if msg.photo:
-            s = await bot.send_photo(BOT2_CHANNEL_ID, msg.photo[-1].file_id,
+        if ctype == "фото":
+            s = await bot.send_photo(BOT2_CHANNEL_ID, file_id,
                                      caption=full, parse_mode="MarkdownV2")
-        elif msg.video:
-            s = await bot.send_video(BOT2_CHANNEL_ID, msg.video.file_id,
+        elif ctype == "видео":
+            s = await bot.send_video(BOT2_CHANNEL_ID, file_id,
                                      caption=full, parse_mode="MarkdownV2")
-        elif msg.animation:
-            s = await bot.send_animation(BOT2_CHANNEL_ID, msg.animation.file_id,
+        elif ctype == "GIF":
+            s = await bot.send_animation(BOT2_CHANNEL_ID, file_id,
                                          caption=full, parse_mode="MarkdownV2")
-        elif msg.audio:
-            s = await bot.send_audio(BOT2_CHANNEL_ID, msg.audio.file_id,
+        elif ctype == "аудио":
+            s = await bot.send_audio(BOT2_CHANNEL_ID, file_id,
                                      caption=full, parse_mode="MarkdownV2")
-        elif msg.voice:
-            s = await bot.send_voice(BOT2_CHANNEL_ID, msg.voice.file_id,
+        elif ctype == "голосовое":
+            s = await bot.send_voice(BOT2_CHANNEL_ID, file_id,
                                      caption=full, parse_mode="MarkdownV2")
-        elif msg.document:
-            s = await bot.send_document(BOT2_CHANNEL_ID, msg.document.file_id,
+        elif ctype == "документ":
+            s = await bot.send_document(BOT2_CHANNEL_ID, file_id,
                                         caption=full, parse_mode="MarkdownV2")
-        elif msg.sticker:
-            s = await bot.send_sticker(BOT2_CHANNEL_ID, msg.sticker.file_id)
-            await bot.send_message(BOT2_CHANNEL_ID, f"{header}\n\n{footer}",
+        elif ctype == "стикер":
+            s = await bot.send_sticker(BOT2_CHANNEL_ID, file_id)
+            await bot.send_message(BOT2_CHANNEL_ID, header_footer,
                                    parse_mode="MarkdownV2", disable_web_page_preview=True)
-        elif msg.video_note:
-            s = await bot.send_video_note(BOT2_CHANNEL_ID, msg.video_note.file_id)
-            await bot.send_message(BOT2_CHANNEL_ID, f"{header}\n\n{footer}",
+        elif ctype == "кружок":
+            s = await bot.send_video_note(BOT2_CHANNEL_ID, file_id)
+            await bot.send_message(BOT2_CHANNEL_ID, header_footer,
                                    parse_mode="MarkdownV2", disable_web_page_preview=True)
-        elif msg.text:
+        elif ctype == "текст":
             s = await bot.send_message(BOT2_CHANNEL_ID, full,
                                        parse_mode="MarkdownV2", disable_web_page_preview=True)
         else:
             return None
         return s.message_id if s else None
     except Exception as e:
-        logger.error("send_to_channel: %s", e)
+        logger.error("send_anon_to_channel: %s", e)
         return None
 
-async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None):
+
+async def send_to_channel(context, update, text) -> int | None:
+    return await send_anon_to_channel(context, _content_from_message(update.message, text))
+
+def _md_escape(t: str) -> str:
+    """Экранирует спецсимволы legacy Markdown, чтобы уведомление не падало."""
+    return re.sub(r"([_*\[\]`])", r"\\\1", t or "")
+
+
+async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None, publish_id=None):
     u = update.effective_user
     ustr = f"`@{u.username}`" if u.username else "—"
     name = get_display_name(u.id, u.username, u.first_name, u.last_name)
@@ -1622,11 +1721,11 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
         "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
         f"👤 ID: `{u.id}`",
         f"🔗 Username: {ustr}",
-        f"📛 Имя: {name}",
+        f"📛 Имя: {_md_escape(name)}",
         f"📎 Тип: {ctype}",
     ]
     if blocked_reason:
-        lines.append(f"❌ Причина блока: {blocked_reason}")
+        lines.append(f"❌ Причина блока: {_md_escape(blocked_reason)}")
     if ctext:
         safe_text = ctext[:300].replace("`", "'")
         lines.append(f"💬 Текст:\n`{safe_text}`")
@@ -1634,26 +1733,40 @@ async def notify_admin_silent(context, update, ctype, ctext, blocked_reason=None
     caption = "\n".join(lines)
     msg = update.message
     bot = context.bot
-    try:
-        if blocked_reason:
-            if msg.photo:
-                await bot.send_photo(ADMIN_ID, msg.photo[-1].file_id,
-                                     caption=caption, parse_mode="Markdown")
-            elif msg.video:
-                await bot.send_video(ADMIN_ID, msg.video.file_id,
-                                     caption=caption, parse_mode="Markdown")
-            elif msg.animation:
-                await bot.send_animation(ADMIN_ID, msg.animation.file_id,
-                                         caption=caption, parse_mode="Markdown")
-            elif msg.sticker:
-                await bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
-                await bot.send_sticker(ADMIN_ID, msg.sticker.file_id)
+
+    kb = None
+    if blocked_reason and publish_id:
+        kb = PTBInlineKeyboardMarkup([[
+            PTBInlineKeyboardButton("✅  Опубликовать как анонимку",
+                                    callback_data=f"pub_{publish_id}")
+        ]])
+
+    for rid in admin_recipients():
+        try:
+            if blocked_reason:
+                if msg.photo:
+                    await bot.send_photo(rid, msg.photo[-1].file_id,
+                                         caption=caption, parse_mode="Markdown",
+                                         reply_markup=kb)
+                elif msg.video:
+                    await bot.send_video(rid, msg.video.file_id,
+                                         caption=caption, parse_mode="Markdown",
+                                         reply_markup=kb)
+                elif msg.animation:
+                    await bot.send_animation(rid, msg.animation.file_id,
+                                             caption=caption, parse_mode="Markdown",
+                                             reply_markup=kb)
+                elif msg.sticker:
+                    await bot.send_message(rid, caption, parse_mode="Markdown",
+                                           reply_markup=kb)
+                    await bot.send_sticker(rid, msg.sticker.file_id)
+                else:
+                    await bot.send_message(rid, caption, parse_mode="Markdown",
+                                           reply_markup=kb)
             else:
-                await bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
-        else:
-            await bot.send_message(ADMIN_ID, caption, parse_mode="Markdown")
-    except Exception as e:
-        logger.error("Админ-уведомление: %s", e)
+                await bot.send_message(rid, caption, parse_mode="Markdown")
+        except Exception as e:
+            logger.error("Админ-уведомление %s: %s", rid, e)
 
     if blocked_reason and MODERATION_LOG_CHANNEL_ID:
         log_msg_id = await post_blocked_to_log_channel(context, update, ctype, ctext, blocked_reason)
@@ -1798,7 +1911,7 @@ async def bot2_cmd_start(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     )
 
 async def bot2_cmd_cancel(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in admin_authorized:
         return
     popped = (context.user_data.pop("awaiting_broadcast", None)
               or context.user_data.pop("awaiting_ids", None)
@@ -1839,16 +1952,32 @@ def admin_text():
     )
 
 async def bot2_cmd_admin(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔️ Доступ запрещён.")
+    u = update.effective_user
+    secret = " ".join(context.args) if context.args else ""
+
+    if not admin_secret_ok(secret):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await update.message.reply_text("⛔️ Неверный пароль.")
         return
+
+    admin_authorized.add(u.id)
+
+    # Убираем сообщение с паролем из истории чата
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     await update.message.reply_text(admin_text(), reply_markup=admin_keyboard())
 
 async def admin_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     global auto_approve_enabled
     query = update.callback_query
     data = query.data
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in admin_authorized:
         await query.answer("⛔️ Доступ запрещён.", show_alert=True)
         return
 
@@ -2004,7 +2133,7 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
     uid = update.effective_user.id
     record_active_user_id(uid)
 
-    if context.user_data.get("awaiting_test_media") and uid == ADMIN_ID:
+    if context.user_data.get("awaiting_test_media") and uid in admin_authorized:
         msg = update.message
         if msg.text and not msg.photo and not msg.video and not msg.animation and not msg.sticker:
             await msg.reply_text("⚠️ Отправь фото, видео, GIF или стикер для теста.")
@@ -2060,7 +2189,7 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
             reply_markup=top_keyboard(uid))
         return
 
-    if context.user_data.get("awaiting_ids") and uid == ADMIN_ID:
+    if context.user_data.get("awaiting_ids") and uid in admin_authorized:
         text = (update.message.text or "").strip()
         new_ids = [int(x) for x in re.findall(r'\b\d+\b', text)]
         if not new_ids:
@@ -2079,7 +2208,7 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
         context.user_data.pop("awaiting_ids", None)
         return
 
-    if context.user_data.get("awaiting_broadcast") and uid == ADMIN_ID:
+    if context.user_data.get("awaiting_broadcast") and uid in admin_authorized:
         txt = update.message.text
         if not txt:
             await update.message.reply_text("❌ Сообщение не может быть пустым.")
@@ -2101,7 +2230,7 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
         await update.message.reply_text(f"✅ Готово!\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}")
         return
 
-    if context.user_data.get("awaiting_block_add") and uid == ADMIN_ID:
+    if context.user_data.get("awaiting_block_add") and uid in admin_authorized:
         raw = (update.message.text or "").strip()
         parts = raw.split(maxsplit=1)
         target = resolve_block_target(parts[0]) if parts else None
@@ -2122,7 +2251,7 @@ async def bot2_handle_message(update: Update, context: PTBContextTypes.DEFAULT_T
                                         parse_mode="Markdown", reply_markup=admin_keyboard())
         return
 
-    if context.user_data.get("awaiting_block_remove") and uid == ADMIN_ID:
+    if context.user_data.get("awaiting_block_remove") and uid in admin_authorized:
         raw = (update.message.text or "").strip()
         target = resolve_block_target(raw)
         if target is None:
@@ -2175,8 +2304,7 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ok, reason = await is_image_acceptable(context.bot, msg.photo[-1].file_id)
         if not ok:
-            _log_blocked(uid, update, ctype, text, reason, now)
-            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await _block_and_notify(uid, update, context, ctype, text, reason, now)
             await msg.reply_text(f"🚫 *Изображение не принято*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
@@ -2184,8 +2312,7 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ok, reason = await is_sticker_acceptable(context.bot, msg.sticker)
         if not ok:
-            _log_blocked(uid, update, ctype, text, reason, now)
-            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await _block_and_notify(uid, update, context, ctype, text, reason, now)
             await msg.reply_text(f"🚫 *Стикер не принят*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
@@ -2194,8 +2321,7 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
         file_id = msg.video.file_id if msg.video else msg.animation.file_id
         ok, reason = await is_video_acceptable(context.bot, file_id)
         if not ok:
-            _log_blocked(uid, update, ctype, text, reason, now)
-            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await _block_and_notify(uid, update, context, ctype, text, reason, now)
             await msg.reply_text(f"🚫 *Видео не принято*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
@@ -2203,16 +2329,14 @@ async def handle_anonymous(update: Update, context: PTBContextTypes.DEFAULT_TYPE
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         ok, reason = await is_video_acceptable(context.bot, msg.video_note.file_id)
         if not ok:
-            _log_blocked(uid, update, ctype, text, reason, now)
-            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await _block_and_notify(uid, update, context, ctype, text, reason, now)
             await msg.reply_text(f"🚫 *Кружок не принят*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
     elif msg.text:
         ok, reason = await is_content_acceptable(msg.text)
         if not ok:
-            _log_blocked(uid, update, ctype, text, reason, now)
-            await notify_admin_silent(context, update, ctype, text, blocked_reason=reason)
+            await _block_and_notify(uid, update, context, ctype, text, reason, now)
             await msg.reply_text(f"🚫 *Сообщение не принято*\n\nПричина: {reason}", parse_mode="Markdown")
             return
 
@@ -2256,6 +2380,86 @@ def _log_blocked(uid, update, ctype, text, reason, now):
         "blocked": reason,
     })
 
+
+def _queue_blocked(uid, update, ctype, text, reason) -> str:
+    """Сохраняет заблокированную анонимку, чтобы админ мог опубликовать её вручную."""
+    token = secrets.token_hex(4)
+    while token in blocked_pending:
+        token = secrets.token_hex(4)
+
+    u = update.effective_user
+    blocked_pending[token] = {
+        "user_id": uid,
+        "username": u.username,
+        "first_name": u.first_name,
+        "last_name": u.last_name,
+        "content_type": ctype,
+        "text": text,
+        "file_id": _file_id_of(update.message),
+        "reason": reason,
+        "timestamp": datetime.now().isoformat(),
+    }
+    # Храним только последние 200 заблокированных сообщений
+    while len(blocked_pending) > 200:
+        blocked_pending.pop(next(iter(blocked_pending)))
+    _save_json(BLOCKED_PENDING_FILE, blocked_pending)
+    return token
+
+
+async def _block_and_notify(uid, update, context, ctype, text, reason, now):
+    token = _queue_blocked(uid, update, ctype, text, reason)
+    _log_blocked(uid, update, ctype, text, reason, now)
+    await notify_admin_silent(context, update, ctype, text,
+                               blocked_reason=reason, publish_id=token)
+
+
+async def publish_blocked(update: Update, context: PTBContextTypes.DEFAULT_TYPE, token: str):
+    """Публикует заблокированную анонимку в канал по кнопке админа."""
+    query = update.callback_query
+
+    if update.effective_user.id != ADMIN_ID and update.effective_user.id not in admin_authorized:
+        await query.answer("⛔️ Доступ запрещён.", show_alert=True)
+        return
+
+    entry = blocked_pending.get(token)
+    if not entry:
+        await query.answer("⌛️ Анонимка уже опубликована или устарела.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    mid = await send_anon_to_channel(context, entry)
+    if mid is None:
+        await query.answer("❌ Не удалось опубликовать. Проверь логи.", show_alert=True)
+        return
+
+    now = datetime.now()
+    log_entry = {
+        "user_id": entry.get("user_id"),
+        "username": entry.get("username"),
+        "first_name": entry.get("first_name"),
+        "last_name": entry.get("last_name"),
+        "content_type": entry.get("content_type"),
+        "text": entry.get("text"),
+        "timestamp": now.isoformat(),
+        "channel_msg_id": mid,
+        "manual_publish": True,
+    }
+    add_message_log(log_entry)
+    add_anon_message_log(log_entry)
+    increment_top(entry.get("user_id"))
+
+    blocked_pending.pop(token, None)
+    _save_json(BLOCKED_PENDING_FILE, blocked_pending)
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.answer("✅ Опубликовано в канале")
+
 async def bot2_auto_approve_join(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     req = update.chat_join_request
     if not req:
@@ -2272,8 +2476,13 @@ async def bot2_auto_approve_join(update: Update, context: PTBContextTypes.DEFAUL
 
 async def bot2_button_callback(update: Update, context: PTBContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
+
+    if data.startswith("pub_"):
+        await publish_blocked(update, context, data[len("pub_"):])
+        return
+
+    await query.answer()
     uid = update.effective_user.id
 
     if (data.startswith("admin_") or data.startswith("msg_page_")

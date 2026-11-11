@@ -1,0 +1,29 @@
+# Секреты
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Рантайм-данные ботов (не коммитим персональные данные пользователей)
+anon_logs.json
+start_logs.json
+top_data.json
+anon_messages_log.json
+blocked_users.json
+settings.json
+bot_state.json
+se_checks.json
+manual_ids.json
+blocked_pending.json
+
+# Прочее
+*.log
+.DS_Store
+Thumbs.db
