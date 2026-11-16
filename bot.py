@@ -1807,12 +1807,11 @@ async def is_content_acceptable(text: str) -> tuple[bool, str]:
 
 def _anon_header_footer() -> tuple[str, str]:
     bot_link = f"https://t.me/{BOT2_USERNAME}"
-    chat_link = BOT2_CHAT_INVITE
     header = (
         f"*📩 Анонимное сообщение*\n"
         f">[🔴 Отправить анонимку]({bot_link})"
     )
-    footer = f">[вейп барахолка и по совместительству чат шiкунчиков]({chat_link})"
+    footer = ">[в 6 - 7 школе любят](https://t.me/v67shkole)"
     return header, footer
 
 
