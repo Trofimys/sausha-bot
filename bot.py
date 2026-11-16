@@ -1811,7 +1811,8 @@ def _anon_header_footer() -> tuple[str, str]:
         f"*📩 Анонимное сообщение*\n"
         f">[🔴 Отправить анонимку]({bot_link})"
     )
-    footer = ">[в 6 - 7 школе любят](https://t.me/v67shkole)"
+    # Дефисы в MarkdownV2 нужно экранировать, иначе Telegram отклоняет сообщение
+    footer = ">[в 6 \\- 7 школе любят](https://t.me/v67shkole)"
     return header, footer
 
 
